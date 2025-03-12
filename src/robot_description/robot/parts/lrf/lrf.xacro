@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find robot_description)/robot/parts/lrf/lrf.gazebo"/>
+
+  <xacro:macro name="lrf_v0" params="parent *joint_origin">
+	<joint name="lrf_joint" type="fixed">
+	  <xacro:insert_block name="joint_origin"/>
+	  <parent link="${parent}"/>
+	  <child link="lrf_link"/>
+	</joint>
+	<link name="lrf_link">
+	  <visual>
+		<geometry>
+		  <mesh filename="package://robot_description/meshes/DAE/lidar/lidar.dae"/>
+		</geometry>
+	  </visual>
+	  <collision>
+		<geometry>
+		  <mesh filename="package://robot_description/meshes/STL/lidar/lidar.stl"/>
+		</geometry>
+	  </collision>
+	  <inertial>
+		<origin xyz="0.0 0.0 0.0"/>
+		<mass value="0.25"/>
+		<inertia ixx="0.00031" ixy="0" ixz="0" iyy="0.0005" iyz="0" izz="0.00031"/>
+	  </inertial>
+	</link>
+  </xacro:macro>
+
+</robot>
