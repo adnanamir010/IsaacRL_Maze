@@ -6,13 +6,38 @@ from std_msgs.msg import Float64MultiArray
 from omni.isaac.core.objects import XFormPrim
 from pxr import UsdGeom
 
-class DDEnvironment(Node):
+class DDEnv(Node):
     """
-    Robot environment for reinforcement learning in Isaac Sim.
+    Robot environment for Differential Drive in Isaac Sim.
     This environment simulates a robot navigating through obstacles to reach a goal.
     """
-    def __init__(self):
+    def __init__(self, world, simulation_context, image_size, pixel_to_meter,
+                 stage_width, stage_height, wheelbase, image, image_for_clash_calc):
+        """
+        Initialize the robot environment with explicit dependencies.
+        
+        Args:
+            world: The Isaac Sim world object
+            simulation_context: The simulation context for stepping the simulation
+            image_size: Size of the image used for visualization and collision detection
+            pixel_to_meter: Conversion ratio from pixels to meters
+            stage_width: Width of the stage in simulation
+            stage_height: Height of the stage in simulation
+            wheelbase: Wheelbase length of the robot
+            image: Image for visualization
+            image_for_clash_calc: Image for collision detection
+        """
         super().__init__('environment')
+        
+        # Store passed references
+        self.world = world
+        self.simulation_context = simulation_context
+        self.image = image
+        self.image_for_clash_calc = image_for_clash_calc
+        self.stage_width = stage_width
+        self.stage_height = stage_height
+        self.wheelbase = wheelbase
+        self.pixel_to_meter = pixel_to_meter
 
         # Robot control parameters
         self.steering_angle = np.array([0, 0], float)  # left, right knuckle positions
@@ -50,7 +75,7 @@ class DDEnvironment(Node):
     
     def _initialize_cube_geometry(self):
         """Initialize the cube geometries for obstacles"""
-        stage = my_world.stage
+        stage = self.world.stage
         
         for i, transform in enumerate(self.cube_transforms):
             # Create cube geometry
@@ -59,7 +84,7 @@ class DDEnvironment(Node):
             # Set cube size
             cube_geom.GetSizeAttr().Set(self.obstacle_size)
 
-    def step(self, action, time_steps, max_episode_steps):
+    def step(self, action, time_steps, max_episode_steps, body_pose, lidar_data, clash_sum):
         """
         Execute one step in the environment.
         
@@ -67,13 +92,14 @@ class DDEnvironment(Node):
             action: Control action for the robot (steering)
             time_steps: Current time step in the episode
             max_episode_steps: Maximum time steps per episode
+            body_pose: Current pose of the robot [x, y, theta]
+            lidar_data: Current lidar readings
+            clash_sum: Current collision status
             
         Returns:
-            next_state: New state after taking the action
-            reward: Reward for the action
-            done: Whether the episode is finished
+            tuple: (next_state, reward, done, body_pose, clash_sum) - New state, reward, done flag,
+                  updated body pose, and updated clash status
         """
-        global body_pose, lidar_data, clash_sum
 
         self.done = False
         self.angular_velocity = 2 * action[0]
@@ -106,7 +132,7 @@ class DDEnvironment(Node):
 
         # Simulate for multiple steps
         for _ in range(20):
-            simulation_context.step(render=True)
+            self.simulation_context.step(render=True)
 
         # Calculate distance to goal
         distance_to_goal = math.sqrt((body_pose[0] - self.goal_position[0])**2 + 
@@ -118,7 +144,7 @@ class DDEnvironment(Node):
         self.current_state[21] = (body_pose[1] - self.goal_position[1]) / 48   # Normalized y distance
 
         # Calculate reward and check termination conditions
-        reward = self._calculate_reward(distance_to_goal, clash_sum, time_steps, max_episode_steps)
+        reward = self._calculate_reward(distance_to_goal, clash_sum, time_steps, max_episode_steps, body_pose, lidar_data)
         
         # Update previous distance for next step
         self.prev_distance = distance_to_goal
@@ -126,11 +152,23 @@ class DDEnvironment(Node):
         self.get_logger().info(f"State: {self.current_state}, Collision: {clash_sum}, " 
                               f"Reward: {reward}, Angular velocity: {self.angular_velocity}")
 
-        return self.current_state, reward, self.done
+        return self.current_state, reward, self.done, body_pose, clash_sum
 
-    def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps):
-        """Calculate reward based on current state"""
+    def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps, body_pose, lidar_data):
+        """
+        Calculate reward based on current state.
         
+        Args:
+            distance_to_goal: Current distance to goal
+            clash_sum: Collision indicator
+            time_steps: Current time steps
+            max_episode_steps: Maximum time steps per episode
+            body_pose: Current robot pose
+            lidar_data: Current lidar readings
+            
+        Returns:
+            float: Calculated reward
+        """
         # Check for collision
         if clash_sum > 0:
             self.get_logger().info("COLLISION DETECTED. EPISODE ENDED.")
@@ -160,14 +198,20 @@ class DDEnvironment(Node):
         else:
             return -1  # Penalty for moving away from the goal
 
-    def reset(self):
-        """Reset the environment to initial state with random obstacle placement"""
-        global euler_angle
+    def reset(self, euler_angle=None):
+        """
+        Reset the environment to initial state with random obstacle placement.
         
+        Args:
+            euler_angle: Euler angle for robot orientation (optional)
+            
+        Returns:
+            numpy.ndarray: Initial state
+        """
         # Reset simulation and images
-        simulation_context.reset()
-        image_for_clash_calc[:,:] = 0
-        image[:,:,:] = 0
+        self.simulation_context.reset()
+        self.image_for_clash_calc[:,:] = 0
+        self.image[:,:,:] = 0
         self.prev_distance = 0
 
         # Draw start and goal regions
@@ -190,14 +234,18 @@ class DDEnvironment(Node):
     def _draw_start_goal_regions(self):
         """Draw start and goal regions on the image"""
         # Start region (red)
-        pt_start1 = (int((stage_W/2 - L/2 + 24)/pix2m), int((stage_H/2 + L/2 + 24)/pix2m))
-        pt_start2 = (int((stage_W/2 + L/2 + 24)/pix2m), int((stage_H/2 - L/2 + 24)/pix2m))
-        cv2.rectangle(image, pt_start1, pt_start2, (0, 0, 255), cv2.FILLED, cv2.LINE_8)
+        pt_start1 = (int((self.stage_width/2 - self.wheelbase/2 + 24)/self.pixel_to_meter), 
+                     int((self.stage_height/2 + self.wheelbase/2 + 24)/self.pixel_to_meter))
+        pt_start2 = (int((self.stage_width/2 + self.wheelbase/2 + 24)/self.pixel_to_meter), 
+                     int((self.stage_height/2 - self.wheelbase/2 + 24)/self.pixel_to_meter))
+        cv2.rectangle(self.image, pt_start1, pt_start2, (0, 0, 255), cv2.FILLED, cv2.LINE_8)
         
         # Goal region (blue)
-        pt_goal1 = (int((stage_W/2 - L/2 - 24)/pix2m), int((stage_H/2 + L/2 - 24)/pix2m))
-        pt_goal2 = (int((stage_W/2 + L/2 - 24)/pix2m), int((stage_H/2 - L/2 - 24)/pix2m))
-        cv2.rectangle(image, pt_goal1, pt_goal2, (255, 0, 0), cv2.FILLED, cv2.LINE_8)
+        pt_goal1 = (int((self.stage_width/2 - self.wheelbase/2 - 24)/self.pixel_to_meter), 
+                   int((self.stage_height/2 + self.wheelbase/2 - 24)/self.pixel_to_meter))
+        pt_goal2 = (int((self.stage_width/2 + self.wheelbase/2 - 24)/self.pixel_to_meter), 
+                   int((self.stage_height/2 - self.wheelbase/2 - 24)/self.pixel_to_meter))
+        cv2.rectangle(self.image, pt_goal1, pt_goal2, (255, 0, 0), cv2.FILLED, cv2.LINE_8)
     
     def _generate_random_obstacle_positions(self):
         """Generate random positions for obstacles"""
@@ -270,16 +318,18 @@ class DDEnvironment(Node):
                 self.cube_transforms[cube_index].set_world_pose(coords, [0.0, 0.0, 0.0, 1.0])
                 
                 # Draw obstacle on image
-                pt1 = (int((stage_W/2 - L/2 + coords[0])/pix2m), int((stage_H/2 + L/2 - coords[1])/pix2m))
-                pt2 = (int((stage_W/2 + L/2 + coords[0])/pix2m), int((stage_H/2 - L/2 - coords[1])/pix2m))
-                cv2.rectangle(image, pt1, pt2, (200, 200, 200), cv2.FILLED, cv2.LINE_8)
-                cv2.rectangle(image_for_clash_calc, pt1, pt2, 255, cv2.FILLED, cv2.LINE_8)
+                pt1 = (int((self.stage_width/2 - self.wheelbase/2 + coords[0])/self.pixel_to_meter), 
+                       int((self.stage_height/2 + self.wheelbase/2 - coords[1])/self.pixel_to_meter))
+                pt2 = (int((self.stage_width/2 + self.wheelbase/2 + coords[0])/self.pixel_to_meter), 
+                       int((self.stage_height/2 - self.wheelbase/2 - coords[1])/self.pixel_to_meter))
+                cv2.rectangle(self.image, pt1, pt2, (200, 200, 200), cv2.FILLED, cv2.LINE_8)
+                cv2.rectangle(self.image_for_clash_calc, pt1, pt2, 255, cv2.FILLED, cv2.LINE_8)
                 
                 cube_index += 1
     
     def _add_boundary_walls(self):
         """Add boundary walls to the environment"""
-        image_for_clash_calc[0:4, :] = 255
-        image_for_clash_calc[716:720, :] = 255
-        image_for_clash_calc[:, 0:4] = 255
-        image_for_clash_calc[:, 716:720] = 255
+        self.image_for_clash_calc[0:4, :] = 255
+        self.image_for_clash_calc[716:720, :] = 255
+        self.image_for_clash_calc[:, 0:4] = 255
+        self.image_for_clash_calc[:, 716:720] = 255
