@@ -1,18 +1,20 @@
+# rl_utils.py
 import math
 import torch
-
 import numpy as np
 import copy
-import math
-import cv2
 from math import cos, sin, atan2
-import torch
+import cv2
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import LaserScan, Image
 from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
+import matplotlib.pyplot as plt
+import os
+import datetime
+import global_vars
 
 # Initialize bridge for converting between OpenCV and ROS images
 bridge = CvBridge()
@@ -30,20 +32,18 @@ class ModelStateSubscriber(Node):
             10)
         
     def listener_callback(self, data):
-        global body_pose
-
         pose = data.transforms[1].transform.translation
         orientation = data.transforms[1].transform.rotation
 
-        body_pose[0] = pose.x
-        body_pose[1] = pose.y
+        global_vars.body_pose[0] = pose.x
+        global_vars.body_pose[1] = pose.y
         
         # Calculate yaw from quaternion
         q0 = orientation.x
         q1 = orientation.y
         q2 = orientation.z
         q3 = orientation.w
-        body_pose[2] = -atan2(2*(q0*q1 + q2*q3), (q0**2 - q1**2 - q2**2 + q3**2))
+        global_vars.body_pose[2] = -atan2(2*(q0*q1 + q2*q3), (q0**2 - q1**2 - q2**2 + q3**2))
 
 class LidarSubscriber(Node):
     """
@@ -58,21 +58,19 @@ class LidarSubscriber(Node):
             10)
         
         # Store previous lidar data to handle invalid readings
-        self.prev_lidar_data = np.zeros(20)
+        self.lidar_data_prev_step = np.zeros(20)
 
     def listener_callback(self, data):
-        global lidar_data
-
         for i in range(20):
             value = data.ranges[180*i:180*i + 8]
-            lidar_data[i] = np.max(value)
+            global_vars.lidar_data[i] = np.max(value)
             
             # If reading is invalid, use previous value
-            if lidar_data[i] <= 0:
-                lidar_data[i] = self.prev_lidar_data[i]
+            if global_vars.lidar_data[i] <= 0:
+                global_vars.lidar_data[i] = self.lidar_data_prev_step[i]
                 
         # Store current readings for next callback
-        self.prev_lidar_data = copy.copy(lidar_data)
+        self.lidar_data_prev_step = copy.copy(global_vars.lidar_data)
 
 class CollisionDetector(Node):
     """
@@ -112,15 +110,18 @@ class CollisionDetector(Node):
         self.timer = self.create_timer(self.time_interval, self.timer_callback)
 
     def timer_callback(self):
-        global body_pose, clash_sum
+        # Check if global variables are initialized
+        if global_vars.image is None or global_vars.image_for_clash_calc is None:
+            self.get_logger().warn("Global image variables not initialized yet")
+            return
 
         # Copy current environment images
-        self.current_image = copy.copy(image)
-        self.collision_image = copy.copy(image_for_clash_calc)
+        self.current_image = copy.copy(global_vars.image)
+        self.collision_image = copy.copy(global_vars.image_for_clash_calc)
         self.robot_region[:,:] = 0
 
         # Get robot orientation
-        theta = body_pose[2]
+        theta = global_vars.body_pose[2]
         
         # Calculate outer boundary points (with safety margin)
         self.outer_boundary = self._calculate_boundary_points(theta, self.boundary_length, self.boundary_width)
@@ -145,8 +146,12 @@ class CollisionDetector(Node):
         
         # Detect collision
         collision_mask = cv2.bitwise_and(self.robot_region, self.collision_image)
-        clash_sum = cv2.countNonZero(collision_mask)
+        global_vars.clash_sum = cv2.countNonZero(collision_mask)
  
+        # Debug log
+        if global_vars.clash_sum > 0:
+            self.get_logger().info(f"COLLISION DETECTED! clash_sum: {global_vars.clash_sum}")
+        
         # Publish visualization images
         self.collision_mask_pub.publish(bridge.cv2_to_imgmsg(collision_mask))
         self.combined_image_pub.publish(bridge.cv2_to_imgmsg(self.current_image))
@@ -154,21 +159,13 @@ class CollisionDetector(Node):
     def _calculate_boundary_points(self, theta, length, width):
         """
         Calculate the four corner points of a rectangle given its center, dimensions and orientation.
-        
-        Args:
-            theta: Orientation angle
-            length: Length of rectangle
-            width: Width of rectangle
-            
-        Returns:
-            List of four corner points
         """
         half_length = length / 2
         half_width = width / 2
         
         # Calculate robot position in image coordinates
-        robot_x = self.center_w + body_pose[0] / self.pixel_to_meter
-        robot_y = self.center_h - body_pose[1] / self.pixel_to_meter
+        robot_x = self.center_w + global_vars.body_pose[0] / self.pixel_to_meter
+        robot_y = self.center_h - global_vars.body_pose[1] / self.pixel_to_meter
         
         # Calculate corner points
         points = [
@@ -187,49 +184,6 @@ class CollisionDetector(Node):
         ]
         
         return points
-
-
-# RL Algorithm utility functions
-
-def create_log_gaussian(mean, log_std, t):
-    """
-    Create log of Gaussian distribution.
-    
-    Args:
-        mean: Mean of the distribution
-        log_std: Log of standard deviation
-        t: Input tensor
-        
-    Returns:
-        Log probability
-    """
-    quadratic = -((0.5 * (t - mean) / (log_std.exp())).pow(2))
-    l = mean.shape
-    log_z = log_std
-    z = l[-1] * math.log(2 * math.pi)
-    log_p = quadratic.sum(dim=-1) - log_z.sum(dim=-1) - 0.5 * z
-    return log_p
-
-def logsumexp(inputs, dim=None, keepdim=False):
-    """
-    Compute log of sum of exponentials in a numerically stable way.
-    
-    Args:
-        inputs: Input tensor
-        dim: Dimension to reduce
-        keepdim: Whether to keep the reduced dimension
-        
-    Returns:
-        Result of log-sum-exp operation
-    """
-    if dim is None:
-        inputs = inputs.view(-1)
-        dim = 0
-    s, _ = torch.max(inputs, dim=dim, keepdim=True)
-    outputs = s + (inputs - s).exp().sum(dim=dim, keepdim=True).log()
-    if not keepdim:
-        outputs = outputs.squeeze(dim)
-    return outputs
 
 def soft_update(target, source, tau):
     """
@@ -253,3 +207,110 @@ def hard_update(target, source):
     """
     for target_param, param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_(param.data)
+
+def save_learning_curve(episodes, rewards, eval_episodes, eval_rewards, filename='learning_curve'):
+    """
+    Save a plot of the learning curve showing training and evaluation rewards with confidence bands.
+    
+    Args:
+        episodes: List of episode numbers for training
+        rewards: List of training episode rewards
+        eval_episodes: List of episode numbers for evaluation
+        eval_rewards: List of evaluation rewards
+        filename: Filename for the saved plot
+    """
+    plt.figure(figsize=(12, 8))
+    
+    # Plot training rewards
+    plt.plot(episodes, rewards, 'b-', alpha=0.2, label='Training Rewards')
+    
+    # Add a smoothed version of training rewards with confidence bands
+    window_size = min(len(rewards) // 5, 10) if len(rewards) > 10 else 1
+    if window_size > 1:
+        smoothed_rewards = []
+        confidence_upper = []
+        confidence_lower = []
+        
+        for i in range(len(rewards)):
+            start_idx = max(0, i - window_size)
+            end_idx = min(len(rewards), i + window_size + 1)
+            window_rewards = rewards[start_idx:end_idx]
+            
+            # Calculate mean and standard deviation for the window
+            mean_reward = sum(window_rewards) / len(window_rewards)
+            smoothed_rewards.append(mean_reward)
+            
+            # Calculate standard deviation for confidence bands
+            if len(window_rewards) > 1:
+                std_dev = np.std(window_rewards)
+                # 95% confidence interval (approximately 1.96 standard deviations)
+                confidence_upper.append(mean_reward + 1.96 * std_dev / np.sqrt(len(window_rewards)))
+                confidence_lower.append(mean_reward - 1.96 * std_dev / np.sqrt(len(window_rewards)))
+            else:
+                confidence_upper.append(mean_reward)
+                confidence_lower.append(mean_reward)
+        
+        # Plot smoothed line
+        plt.plot(episodes, smoothed_rewards, 'b-', linewidth=2, label=f'Smoothed Training (window={window_size*2+1})')
+        
+        # Plot confidence bands
+        plt.fill_between(episodes, confidence_lower, confidence_upper, color='b', alpha=0.2, label='95% Confidence Interval')
+    
+    # Plot evaluation rewards if available
+    if eval_episodes and eval_rewards:
+        plt.plot(eval_episodes, eval_rewards, 'r-', linewidth=2, label='Evaluation Rewards')
+        
+        # If we have multiple evaluation points, add a smoothed trend line
+        if len(eval_rewards) > 3:
+            eval_smooth = []
+            for i in range(len(eval_rewards)):
+                start_idx = max(0, i - 1)
+                end_idx = min(len(eval_rewards), i + 2)
+                eval_smooth.append(sum(eval_rewards[start_idx:end_idx]) / (end_idx - start_idx))
+            plt.plot(eval_episodes, eval_smooth, 'r--', linewidth=1.5, alpha=0.7, label='Evaluation Trend')
+    
+    # Add labels and title
+    plt.xlabel('Episodes')
+    plt.ylabel('Reward')
+    plt.title('SAC Learning Curve - Obstacle Avoidance')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Save the figure
+    curves_dir = 'learning_curves'
+    if not os.path.exists(curves_dir):
+        os.makedirs(curves_dir)
+        
+    # Add timestamp to prevent overwriting
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    full_path = f"{curves_dir}/{filename}_{timestamp}.png"
+    
+    plt.savefig(full_path)
+    print(f"Learning curve saved to {full_path}")
+    
+    # Also save data as CSV for later analysis
+    csv_path = f"{curves_dir}/{filename}_{timestamp}.csv"
+    with open(csv_path, 'w') as f:
+        f.write("episode,training_reward,smoothed_reward,confidence_lower,confidence_upper,eval_episode,eval_reward\n")
+        
+        # Save all data including smoothed values and confidence bands
+        for i in range(len(episodes)):
+            ep = episodes[i]
+            rw = rewards[i]
+            smooth = smoothed_rewards[i] if i < len(smoothed_rewards) else ""
+            c_lower = confidence_lower[i] if i < len(confidence_lower) else ""
+            c_upper = confidence_upper[i] if i < len(confidence_upper) else ""
+            
+            # Find matching evaluation episode, if any
+            eval_ep = ""
+            eval_rw = ""
+            if eval_episodes:
+                # Find closest evaluation episode
+                if episodes[i] in eval_episodes:
+                    idx = eval_episodes.index(episodes[i])
+                    eval_ep = eval_episodes[idx]
+                    eval_rw = eval_rewards[idx]
+            
+            f.write(f"{ep},{rw},{smooth},{c_lower},{c_upper},{eval_ep},{eval_rw}\n")
+            
+    print(f"Learning curve data saved to {csv_path}")

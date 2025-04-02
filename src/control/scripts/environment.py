@@ -3,8 +3,9 @@ import math
 import cv2
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
-from omni.isaac.core.objects import XFormPrim
+from omni.isaac.core.prims import XFormPrim
 from pxr import UsdGeom
+import global_vars
 
 class DDEnv(Node):
     """
@@ -12,40 +13,31 @@ class DDEnv(Node):
     This environment simulates a robot navigating through obstacles to reach a goal.
     """
     def __init__(self, world, simulation_context, image_size, pixel_to_meter,
-                 stage_width, stage_height, wheelbase, image, image_for_clash_calc):
+                 stage_width, stage_height, wheelbase, img, img_for_clash_calc):
         """
         Initialize the robot environment with explicit dependencies.
-        
-        Args:
-            world: The Isaac Sim world object
-            simulation_context: The simulation context for stepping the simulation
-            image_size: Size of the image used for visualization and collision detection
-            pixel_to_meter: Conversion ratio from pixels to meters
-            stage_width: Width of the stage in simulation
-            stage_height: Height of the stage in simulation
-            wheelbase: Wheelbase length of the robot
-            image: Image for visualization
-            image_for_clash_calc: Image for collision detection
         """
         super().__init__('environment')
         
         # Store passed references
         self.world = world
         self.simulation_context = simulation_context
-        self.image = image
-        self.image_for_clash_calc = image_for_clash_calc
         self.stage_width = stage_width
         self.stage_height = stage_height
         self.wheelbase = wheelbase
         self.pixel_to_meter = pixel_to_meter
+        
+        # Initialize global variables
+        global_vars.image = img
+        global_vars.image_for_clash_calc = img_for_clash_calc
 
         # Robot control parameters
         self.steering_angle = np.array([0, 0], float)  # left, right knuckle positions
         self.wheel_speed = np.array([0, 0], float)     # left, right wheel velocities
         
         # Publishers for robot control
-        self.steering_publisher = self.create_publisher(Float64MultiArray, '/forward_position_controller/commands', 10)
-        self.velocity_publisher = self.create_publisher(Float64MultiArray, '/forward_velocity_controller/commands', 10)
+        self.steering_publisher = self.create_publisher(Float64MultiArray, '/controller/cmd_pos', 10)
+        self.velocity_publisher = self.create_publisher(Float64MultiArray, '/controller/cmd_vel', 10)
 
         # Robot physical parameters
         self.track_width = 1.1   # Track width between wheels
@@ -84,23 +76,10 @@ class DDEnv(Node):
             # Set cube size
             cube_geom.GetSizeAttr().Set(self.obstacle_size)
 
-    def step(self, action, time_steps, max_episode_steps, body_pose, lidar_data, clash_sum):
+    def step(self, action, time_steps, max_episode_steps):
         """
         Execute one step in the environment.
-        
-        Args:
-            action: Control action for the robot (steering)
-            time_steps: Current time step in the episode
-            max_episode_steps: Maximum time steps per episode
-            body_pose: Current pose of the robot [x, y, theta]
-            lidar_data: Current lidar readings
-            clash_sum: Current collision status
-            
-        Returns:
-            tuple: (next_state, reward, done, body_pose, clash_sum) - New state, reward, done flag,
-                  updated body pose, and updated clash status
         """
-
         self.done = False
         self.angular_velocity = 2 * action[0]
 
@@ -135,39 +114,28 @@ class DDEnv(Node):
             self.simulation_context.step(render=True)
 
         # Calculate distance to goal
-        distance_to_goal = math.sqrt((body_pose[0] - self.goal_position[0])**2 + 
-                                     (body_pose[1] - self.goal_position[1])**2)
+        distance_to_goal = math.sqrt((global_vars.body_pose[0] - self.goal_position[0])**2 + 
+                                     (global_vars.body_pose[1] - self.goal_position[1])**2)
 
         # Update state
-        self.current_state[:20] = lidar_data / 30  # Normalize lidar data
-        self.current_state[20] = -(body_pose[0] - self.goal_position[0]) / 48  # Normalized x distance
-        self.current_state[21] = (body_pose[1] - self.goal_position[1]) / 48   # Normalized y distance
+        self.current_state[:20] = global_vars.lidar_data / 30  # Normalize lidar data
+        self.current_state[20] = -(global_vars.body_pose[0] - self.goal_position[0]) / 48  # Normalized x distance
+        self.current_state[21] = (global_vars.body_pose[1] - self.goal_position[1]) / 48   # Normalized y distance
 
         # Calculate reward and check termination conditions
-        reward = self._calculate_reward(distance_to_goal, clash_sum, time_steps, max_episode_steps, body_pose, lidar_data)
+        reward = self._calculate_reward(distance_to_goal, global_vars.clash_sum, time_steps, max_episode_steps)
         
         # Update previous distance for next step
         self.prev_distance = distance_to_goal
 
-        self.get_logger().info(f"State: {self.current_state}, Collision: {clash_sum}, " 
+        self.get_logger().info(f"State: {self.current_state}, Collision: {global_vars.clash_sum}, " 
                               f"Reward: {reward}, Angular velocity: {self.angular_velocity}")
 
-        return self.current_state, reward, self.done, body_pose, clash_sum
+        return self.current_state, reward, self.done
 
-    def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps, body_pose, lidar_data):
+    def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps):
         """
         Calculate reward based on current state.
-        
-        Args:
-            distance_to_goal: Current distance to goal
-            clash_sum: Collision indicator
-            time_steps: Current time steps
-            max_episode_steps: Maximum time steps per episode
-            body_pose: Current robot pose
-            lidar_data: Current lidar readings
-            
-        Returns:
-            float: Calculated reward
         """
         # Check for collision
         if clash_sum > 0:
@@ -182,13 +150,13 @@ class DDEnv(Node):
             return 0
             
         # Check for goal reached
-        if (20.0 < body_pose[0] < 28.0 and -28.0 < body_pose[1] < -20.0):
+        if (20.0 < global_vars.body_pose[0] < 28.0 and -28.0 < global_vars.body_pose[1] < -20.0):
             self.get_logger().info("GOAL REACHED. EPISODE ENDED.")
             self.done = True
             return 20
             
         # Penalty for getting too close to obstacles
-        if min(lidar_data) < 3:
+        if min(global_vars.lidar_data) < 3:
             self.get_logger().info("TOO CLOSE TO OBSTACLE.")
             return -5
             
@@ -201,18 +169,18 @@ class DDEnv(Node):
     def reset(self, euler_angle=None):
         """
         Reset the environment to initial state with random obstacle placement.
-        
-        Args:
-            euler_angle: Euler angle for robot orientation (optional)
-            
-        Returns:
-            numpy.ndarray: Initial state
         """
         # Reset simulation and images
         self.simulation_context.reset()
-        self.image_for_clash_calc[:,:] = 0
-        self.image[:,:,:] = 0
+        
+        # Clear images
+        if global_vars.image_for_clash_calc is not None:
+            global_vars.image_for_clash_calc[:,:] = 0
+        if global_vars.image is not None:
+            global_vars.image[:,:,:] = 0
+            
         self.prev_distance = 0
+        global_vars.clash_sum = 0  # Reset collision counter
 
         # Draw start and goal regions
         self._draw_start_goal_regions()
@@ -233,19 +201,19 @@ class DDEnv(Node):
         
     def _draw_start_goal_regions(self):
         """Draw start and goal regions on the image"""
-        # Start region (red)
-        pt_start1 = (int((self.stage_width/2 - self.wheelbase/2 + 24)/self.pixel_to_meter), 
-                     int((self.stage_height/2 + self.wheelbase/2 + 24)/self.pixel_to_meter))
-        pt_start2 = (int((self.stage_width/2 + self.wheelbase/2 + 24)/self.pixel_to_meter), 
-                     int((self.stage_height/2 - self.wheelbase/2 + 24)/self.pixel_to_meter))
-        cv2.rectangle(self.image, pt_start1, pt_start2, (0, 0, 255), cv2.FILLED, cv2.LINE_8)
+        # Goal region (green)
+        pt_start1 = (int((self.stage_width/2 - self.obstacle_size/2 + 24)/self.pixel_to_meter), 
+                    int((self.stage_height/2 + self.obstacle_size/2 + 24)/self.pixel_to_meter))
+        pt_start2 = (int((self.stage_width/2 + self.obstacle_size/2 + 24)/self.pixel_to_meter), 
+                    int((self.stage_height/2 - self.obstacle_size/2 + 24)/self.pixel_to_meter))
+        cv2.rectangle(global_vars.image, pt_start1, pt_start2, (0, 255, 0), cv2.FILLED, cv2.LINE_8)
         
-        # Goal region (blue)
-        pt_goal1 = (int((self.stage_width/2 - self.wheelbase/2 - 24)/self.pixel_to_meter), 
-                   int((self.stage_height/2 + self.wheelbase/2 - 24)/self.pixel_to_meter))
-        pt_goal2 = (int((self.stage_width/2 + self.wheelbase/2 - 24)/self.pixel_to_meter), 
-                   int((self.stage_height/2 - self.wheelbase/2 - 24)/self.pixel_to_meter))
-        cv2.rectangle(self.image, pt_goal1, pt_goal2, (255, 0, 0), cv2.FILLED, cv2.LINE_8)
+        # Start region (red)
+        pt_goal1 = (int((self.stage_width/2 - self.obstacle_size/2 - 24)/self.pixel_to_meter), 
+                int((self.stage_height/2 + self.obstacle_size/2 - 24)/self.pixel_to_meter))
+        pt_goal2 = (int((self.stage_width/2 + self.obstacle_size/2 - 24)/self.pixel_to_meter), 
+                int((self.stage_height/2 - self.obstacle_size/2 - 24)/self.pixel_to_meter))
+        cv2.rectangle(global_vars.image, pt_goal1, pt_goal2, (0, 0, 255), cv2.FILLED, cv2.LINE_8)
     
     def _generate_random_obstacle_positions(self):
         """Generate random positions for obstacles"""
@@ -318,18 +286,20 @@ class DDEnv(Node):
                 self.cube_transforms[cube_index].set_world_pose(coords, [0.0, 0.0, 0.0, 1.0])
                 
                 # Draw obstacle on image
-                pt1 = (int((self.stage_width/2 - self.wheelbase/2 + coords[0])/self.pixel_to_meter), 
-                       int((self.stage_height/2 + self.wheelbase/2 - coords[1])/self.pixel_to_meter))
-                pt2 = (int((self.stage_width/2 + self.wheelbase/2 + coords[0])/self.pixel_to_meter), 
-                       int((self.stage_height/2 - self.wheelbase/2 - coords[1])/self.pixel_to_meter))
-                cv2.rectangle(self.image, pt1, pt2, (200, 200, 200), cv2.FILLED, cv2.LINE_8)
-                cv2.rectangle(self.image_for_clash_calc, pt1, pt2, 255, cv2.FILLED, cv2.LINE_8)
+                # FIXED: Use obstacle_size instead of wheelbase for correct visualization
+                pt1 = (int((self.stage_width/2 - self.obstacle_size/2 + coords[0])/self.pixel_to_meter), 
+                    int((self.stage_height/2 + self.obstacle_size/2 - coords[1])/self.pixel_to_meter))
+                pt2 = (int((self.stage_width/2 + self.obstacle_size/2 + coords[0])/self.pixel_to_meter), 
+                    int((self.stage_height/2 - self.obstacle_size/2 - coords[1])/self.pixel_to_meter))
+                
+                cv2.rectangle(global_vars.image, pt1, pt2, (200, 200, 200), cv2.FILLED, cv2.LINE_8)
+                cv2.rectangle(global_vars.image_for_clash_calc, pt1, pt2, 255, cv2.FILLED, cv2.LINE_8)
                 
                 cube_index += 1
-    
+
     def _add_boundary_walls(self):
         """Add boundary walls to the environment"""
-        self.image_for_clash_calc[0:4, :] = 255
-        self.image_for_clash_calc[716:720, :] = 255
-        self.image_for_clash_calc[:, 0:4] = 255
-        self.image_for_clash_calc[:, 716:720] = 255
+        global_vars.image_for_clash_calc[0:4, :] = 255
+        global_vars.image_for_clash_calc[716:720, :] = 255
+        global_vars.image_for_clash_calc[:, 0:4] = 255
+        global_vars.image_for_clash_calc[:, 716:720] = 255
