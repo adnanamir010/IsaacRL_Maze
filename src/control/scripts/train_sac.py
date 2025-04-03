@@ -95,7 +95,7 @@ def parse_arguments():
                     help='Random seed (default: 123456)')
     parser.add_argument('--batch_size', type=int, default=64, metavar='N',
                     help='Batch size (default: 64)')
-    parser.add_argument('--num_steps', type=int, default=500_001, metavar='N',
+    parser.add_argument('--num_steps', type=int, default=300_001, metavar='N',
                     help='Maximum number of steps (default: 500_001)')
     parser.add_argument('--hidden_size', type=int, default=64, metavar='N',
                     help='Hidden size (default: 64)')
@@ -235,10 +235,14 @@ def main():
             writer.add_scalar('reward/train', episode_reward, i_episode)
             print("Episode: {}, Total steps: {}, Episode steps: {}, Reward: {}".format(
                 i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
-                
+                            
             # Store training metrics for learning curve
             episode_rewards.append(episode_reward)
             episode_numbers.append(i_episode)
+            
+            # Clear CUDA cache for memory management
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()            
             
             # Evaluation phase
             if i_episode % 10 == 0 and args.eval:
@@ -265,10 +269,14 @@ def main():
                 print("----------------------------------------")
                 print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
                 print("----------------------------------------")
-                
+
                 # Store evaluation metrics for learning curve
                 eval_rewards.append(avg_reward)
                 eval_episode_numbers.append(i_episode)
+
+                # Clear CUDA cache for memory management
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Save model checkpoint periodically
             if i_episode % 20 == 0:

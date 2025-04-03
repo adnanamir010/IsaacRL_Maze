@@ -110,7 +110,7 @@ class DDEnv(Node):
         self.steering_publisher.publish(steering_angle_msg)  
 
         # Simulate for multiple steps
-        for _ in range(10):
+        for _ in range(20):
             self.simulation_context.step(render=True)
 
         # Calculate distance to goal
