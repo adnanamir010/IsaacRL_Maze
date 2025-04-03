@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 # Initialize Isaac Sim Application
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False})
+simulation_app = SimulationApp({"headless": True})
 
 # Import Isaac Sim modules
 import omni
@@ -35,7 +35,7 @@ ext_manager = omni.kit.app.get_app().get_extension_manager()
 ext_manager.set_extension_enabled_immediate("omni.isaac.ros2_bridge", True)
 
 # Spawn world with physics settings
-my_world = World(stage_units_in_meters=1.0, physics_dt=1/500, rendering_dt=1/50)
+my_world = World(stage_units_in_meters=1.0, physics_dt=1/200, rendering_dt=1/20)
 
 # Load the USD stage
 isaac_path = os.environ["HOME"] + "/projects/IsaacRL_Maze/src/stage.usd"
@@ -93,20 +93,20 @@ def parse_arguments():
                     help='Automatically adjust α (default: False)')
     parser.add_argument('--seed', type=int, default=123456, metavar='N',
                     help='Random seed (default: 123456)')
-    parser.add_argument('--batch_size', type=int, default=128, metavar='N',
-                    help='Batch size (default: 128)')
-    parser.add_argument('--num_steps', type=int, default=1000001, metavar='N',
-                    help='Maximum number of steps (default: 1000001)')
-    parser.add_argument('--hidden_size', type=int, default=128, metavar='N',
-                    help='Hidden size (default: 128)')
+    parser.add_argument('--batch_size', type=int, default=64, metavar='N',
+                    help='Batch size (default: 64)')
+    parser.add_argument('--num_steps', type=int, default=500_001, metavar='N',
+                    help='Maximum number of steps (default: 500_001)')
+    parser.add_argument('--hidden_size', type=int, default=64, metavar='N',
+                    help='Hidden size (default: 64)')
     parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
                     help='Model updates per simulator step (default: 1)')
     parser.add_argument('--start_steps', type=int, default=4000, metavar='N',
                     help='Steps sampling random actions (default: 4000)')
     parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
                     help='Value target update interval (default: 1)')
-    parser.add_argument('--replay_size', type=int, default=500000, metavar='N',
-                    help='Size of replay buffer (default: 500000)')
+    parser.add_argument('--replay_size', type=int, default=200000, metavar='N',
+                    help='Size of replay buffer (default: 200000)')
     parser.add_argument('--cuda', action="store_true",
                     help='Run on CUDA (default: False)')
     parser.add_argument('--save-curve', action="store_true",
