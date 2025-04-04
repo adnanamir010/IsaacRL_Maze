@@ -2,25 +2,36 @@ import random
 import numpy as np
 import os
 import pickle
-from collections import deque, namedtuple
+from collections import deque
 
 class ReplayMemory:
     """
-    Replay buffer for off-policy reinforcement learning algorithms like SAC.
-    Stores transitions (state, action, reward, next_state, done) for random sampling.
+    Memory-optimized replay buffer for off-policy reinforcement learning algorithms like SAC.
+    Uses NumPy arrays for efficient storage and access of transitions.
     """
-    def __init__(self, capacity, seed=0):
+    def __init__(self, capacity, state_dim=22, action_dim=1, seed=0):
         """
-        Initialize replay buffer.
+        Initialize optimized replay buffer with pre-allocated NumPy arrays.
         
         Args:
             capacity (int): Maximum size of the buffer
+            state_dim (int): Dimension of state space
+            action_dim (int): Dimension of action space
             seed (int): Random seed for reproducibility
         """
         random.seed(seed)
+        np.random.seed(seed)
+        
         self.capacity = capacity
-        self.buffer = []
         self.position = 0
+        self.size = 0
+        
+        # Pre-allocate fixed NumPy arrays for memory efficiency
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)  # Using float for mask values
         
     def push(self, state, action, reward, next_state, done):
         """
@@ -31,16 +42,22 @@ class ReplayMemory:
             action: Action taken
             reward: Reward received
             next_state: Next state
-            done: Whether the episode terminated
+            done: Whether the episode terminated (or mask value)
         """
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
+        # Store transition in pre-allocated arrays
+        self.states[self.position] = state
+        self.actions[self.position] = action
+        self.rewards[self.position] = reward
+        self.next_states[self.position] = next_state
+        self.dones[self.position] = done
+        
+        # Update position and size
         self.position = (self.position + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
         
     def sample(self, batch_size):
         """
-        Sample a batch of transitions.
+        Sample a batch of transitions using efficient NumPy operations.
         
         Args:
             batch_size (int): Number of transitions to sample
@@ -48,13 +65,21 @@ class ReplayMemory:
         Returns:
             tuple: (states, actions, rewards, next_states, dones)
         """
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
+        # Efficiently sample indices without replacement
+        indices = np.random.choice(self.size, batch_size, replace=False)
+        
+        # Return views into the arrays to avoid unnecessary copying
+        return (
+            self.states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_states[indices],
+            self.dones[indices]
+        )
     
     def __len__(self):
         """Return the current size of the buffer."""
-        return len(self.buffer)
+        return self.size
     
     def save_buffer(self, env_name, suffix="", save_path=None):
         """
@@ -69,9 +94,23 @@ class ReplayMemory:
             os.makedirs('checkpoints/')
         if save_path is None:
             save_path = f"checkpoints/sac_buffer_{env_name}_{suffix}"
+        
         print(f'Saving buffer to {save_path}')
+        
+        # Create a dictionary with buffer data and metadata
+        buffer_dict = {
+            'states': self.states[:self.size],
+            'actions': self.actions[:self.size],
+            'rewards': self.rewards[:self.size],
+            'next_states': self.next_states[:self.size],
+            'dones': self.dones[:self.size],
+            'position': self.position,
+            'size': self.size,
+            'capacity': self.capacity
+        }
+        
         with open(save_path, 'wb') as f:
-            pickle.dump(self.buffer, f)
+            pickle.dump(buffer_dict, f, protocol=4)  # Using protocol 4 for better efficiency
             
     def load_buffer(self, save_path):
         """
@@ -82,18 +121,39 @@ class ReplayMemory:
         """
         print(f'Loading buffer from {save_path}')
         with open(save_path, "rb") as f:
-            self.buffer = pickle.load(f)
-        self.position = len(self.buffer) % self.capacity
+            buffer_dict = pickle.load(f)
+        
+        # Load data and metadata
+        data_size = buffer_dict['size']
+        
+        # Resize arrays if capacity doesn't match
+        if self.capacity < data_size:
+            self.capacity = data_size
+            self.states = np.zeros((self.capacity, self.states.shape[1]), dtype=np.float32)
+            self.actions = np.zeros((self.capacity, self.actions.shape[1]), dtype=np.float32)
+            self.rewards = np.zeros(self.capacity, dtype=np.float32)
+            self.next_states = np.zeros((self.capacity, self.next_states.shape[1]), dtype=np.float32)
+            self.dones = np.zeros(self.capacity, dtype=np.float32)
+        
+        # Copy data to buffer arrays
+        self.states[:data_size] = buffer_dict['states']
+        self.actions[:data_size] = buffer_dict['actions']
+        self.rewards[:data_size] = buffer_dict['rewards']
+        self.next_states[:data_size] = buffer_dict['next_states']
+        self.dones[:data_size] = buffer_dict['dones']
+        
+        self.position = buffer_dict['position']
+        self.size = data_size
 
 
 class RolloutStorage:
     """
-    Storage for on-policy reinforcement learning algorithms like PPO.
-    Collects full trajectories and computes returns and advantages.
+    Memory-optimized storage for on-policy reinforcement learning algorithms like PPO.
+    Uses NumPy arrays for efficient storage and computation of returns and advantages.
     """
     def __init__(self, capacity, state_dim, action_dim, seed=0):
         """
-        Initialize rollout storage.
+        Initialize rollout storage with pre-allocated NumPy arrays.
         
         Args:
             capacity (int): Maximum number of time steps to store
@@ -102,9 +162,13 @@ class RolloutStorage:
             seed (int): Random seed for reproducibility
         """
         random.seed(seed)
-        self.capacity = capacity
+        np.random.seed(seed)
         
-        # Initialize storage
+        self.capacity = capacity
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        # Initialize storage with pre-allocated NumPy arrays
         self.states = np.zeros((capacity, state_dim), dtype=np.float32)
         self.actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.rewards = np.zeros(capacity, dtype=np.float32)
@@ -112,8 +176,8 @@ class RolloutStorage:
         self.returns = np.zeros(capacity, dtype=np.float32)
         self.log_probs = np.zeros(capacity, dtype=np.float32)
         self.masks = np.ones(capacity, dtype=np.float32)  # 1 for not done, 0 for done
-        
-        self.entropies = np.zeros(capacity, dtype=np.float32)  # Optional: store entropies
+        self.advantages = np.zeros(capacity, dtype=np.float32)  # Pre-allocate advantages
+        self.entropies = np.zeros(capacity, dtype=np.float32)  # Store entropies
         
         self.position = 0
         self.full = False
@@ -148,6 +212,7 @@ class RolloutStorage:
     def compute_returns(self, next_value, gamma, gae_lambda):
         """
         Compute returns and advantages using Generalized Advantage Estimation.
+        Uses vectorized NumPy operations for efficiency.
         
         Args:
             next_value: Value estimate for the state after the last stored state
@@ -155,30 +220,32 @@ class RolloutStorage:
             gae_lambda: GAE lambda parameter
         """
         # Calculate how many steps we actually have
-        if self.full:
-            num_steps = self.capacity
-        else:
-            num_steps = self.position
+        num_steps = self.capacity if self.full else self.position
             
         # Initialize advantage
-        advantage = 0
+        self.advantages.fill(0)
+        last_advantage = 0
         
-        # Compute returns and advantages in reverse order
+        # Initialize the next value
+        next_val = next_value
+        
+        # Compute returns and advantages in reverse order (more efficient in NumPy)
         for step in reversed(range(num_steps)):
             # For the last step, use the provided next_value
             if step == num_steps - 1:
-                next_value_step = next_value
+                next_val_step = next_val
             else:
-                next_value_step = self.values[step + 1]
+                next_val_step = self.values[step + 1]
                 
             # Calculate delta (TD error)
-            delta = self.rewards[step] + gamma * next_value_step * self.masks[step] - self.values[step]
+            delta = self.rewards[step] + gamma * next_val_step * self.masks[step] - self.values[step]
             
             # Update advantage using GAE
-            advantage = delta + gamma * gae_lambda * self.masks[step] * advantage
+            last_advantage = delta + gamma * gae_lambda * self.masks[step] * last_advantage
+            self.advantages[step] = last_advantage
             
-            # Store return (advantage + value)
-            self.returns[step] = advantage + self.values[step]
+        # Calculate returns (advantage + value)
+        self.returns[:num_steps] = self.advantages[:num_steps] + self.values[:num_steps]
             
     def get_data(self):
         """
@@ -192,19 +259,21 @@ class RolloutStorage:
         else:
             num_steps = self.position
             
+        # Return slices of the arrays to avoid copying
         return {
             'states': self.states[:num_steps],
             'actions': self.actions[:num_steps],
             'rewards': self.rewards[:num_steps],
             'values': self.values[:num_steps],
             'returns': self.returns[:num_steps],
+            'advantages': self.advantages[:num_steps],  # Include pre-computed advantages
             'log_probs': self.log_probs[:num_steps],
             'masks': self.masks[:num_steps],
             'entropies': self.entropies[:num_steps]
         }
     
     def clear(self):
-        """Reset the storage."""
+        """Reset the storage by simply resetting position."""
         self.position = 0
         self.full = False
         
@@ -216,7 +285,7 @@ class RolloutStorage:
     
     def save_rollouts(self, env_name, suffix="", save_path=None):
         """
-        Save the rollout data to a file.
+        Save the rollout data to a file using optimal pickle protocol.
         
         Args:
             env_name (str): Environment name
@@ -231,7 +300,7 @@ class RolloutStorage:
         
         data = self.get_data()
         with open(save_path, 'wb') as f:
-            pickle.dump(data, f)
+            pickle.dump(data, f, protocol=4)  # Using protocol 4 for better efficiency
             
     def load_rollouts(self, save_path):
         """
@@ -246,6 +315,13 @@ class RolloutStorage:
             
         # Fill the storage with loaded data
         num_steps = len(data['states'])
+        
+        # Resize arrays if necessary
+        if num_steps > self.capacity:
+            self.capacity = num_steps
+            self._resize_arrays()
+        
+        # Copy data to arrays
         self.states[:num_steps] = data['states']
         self.actions[:num_steps] = data['actions']
         self.rewards[:num_steps] = data['rewards']
@@ -255,5 +331,21 @@ class RolloutStorage:
         self.masks[:num_steps] = data['masks']
         self.entropies[:num_steps] = data['entropies']
         
+        # Load advantages if available
+        if 'advantages' in data:
+            self.advantages[:num_steps] = data['advantages']
+        
         self.position = num_steps % self.capacity
         self.full = (num_steps >= self.capacity)
+        
+    def _resize_arrays(self):
+        """Resize internal arrays if capacity changes."""
+        self.states = np.resize(self.states, (self.capacity, self.state_dim))
+        self.actions = np.resize(self.actions, (self.capacity, self.action_dim))
+        self.rewards = np.resize(self.rewards, self.capacity)
+        self.values = np.resize(self.values, self.capacity)
+        self.returns = np.resize(self.returns, self.capacity)
+        self.log_probs = np.resize(self.log_probs, self.capacity)
+        self.masks = np.resize(self.masks, self.capacity)
+        self.advantages = np.resize(self.advantages, self.capacity)
+        self.entropies = np.resize(self.entropies, self.capacity)

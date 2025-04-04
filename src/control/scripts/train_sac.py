@@ -13,6 +13,8 @@ import datetime
 import copy
 import os
 import matplotlib.pyplot as plt
+import gc
+from tqdm import tqdm, trange
 
 # Initialize Isaac Sim Application
 from isaacsim import SimulationApp
@@ -26,9 +28,14 @@ from omni.isaac.core import World
 from agents import SAC
 from memory import ReplayMemory
 from environment import DDEnv
-from rl_utils import ModelStateSubscriber, LidarSubscriber, CollisionDetector, save_learning_curve
+from rl_utils import ModelStateSubscriber, LidarSubscriber, CollisionDetector, save_learning_curve, evaluate_policy
 from torch.utils.tensorboard import SummaryWriter
 import global_vars
+
+# Configure PyTorch memory management
+torch.backends.cudnn.benchmark = True  # Optimize CUDNN
+torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for better performance
+torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for CUDNN
 
 # Enable ROS2 bridge extension
 ext_manager = omni.kit.app.get_app().get_extension_manager()
@@ -51,10 +58,10 @@ simulation_context = omni.isaac.core.SimulationContext()
 simulation_context.initialize_physics()
 simulation_context.play()
 
-# Global variables for robot state and environment
-body_pose = np.array([0.0, 0.0, 0.0], float)  # x, y, theta
-lidar_data = np.zeros(20)
-clash_sum = 0
+# Initialize global variables - using NumPy arrays with specific data types
+global_vars.body_pose = np.zeros(3, dtype=np.float32)  # x, y, theta
+global_vars.lidar_data = np.zeros(20, dtype=np.float32)
+global_vars.clash_sum = 0
 
 # Image settings for visualization and collision detection
 image_size = 720
@@ -63,18 +70,24 @@ wheelbase = 8  # length of robot
 stage_width = image_size * pixel_to_meter
 stage_height = image_size * pixel_to_meter
 
-# Create images for visualization and collision detection
-image = np.zeros((image_size, image_size, 3), np.uint8)
-image_for_clash_calc = np.zeros((image_size, image_size), np.uint8)
-
 # Set numpy print format for better readability
 float_formatter = "{:.2f}".format
 np.set_printoptions(formatter={'float_kind': float_formatter})
 
+# Memory management utilities
+def clear_cuda_cache():
+    """Clear CUDA cache to free up GPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
+def collect_garbage():
+    """Force garbage collection"""
+    gc.collect()
+    clear_cuda_cache()
+
 def parse_arguments():
     """Parse command line arguments for the SAC algorithm"""
     parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
-    # Add your arguments here (copied from your code)
     parser.add_argument('--env-name', default="obstacle_avoidance",
                     help='Environment name (default: obstacle_avoidance)')
     parser.add_argument('--policy', default="Gaussian",
@@ -95,8 +108,8 @@ def parse_arguments():
                     help='Random seed (default: 123456)')
     parser.add_argument('--batch_size', type=int, default=64, metavar='N',
                     help='Batch size (default: 64)')
-    parser.add_argument('--num_steps', type=int, default=300_001, metavar='N',
-                    help='Maximum number of steps (default: 500_001)')
+    parser.add_argument('--num_steps', type=int, default=500_000, metavar='N',
+                    help='Maximum number of steps (default: 1000001)')
     parser.add_argument('--hidden_size', type=int, default=64, metavar='N',
                     help='Hidden size (default: 64)')
     parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
@@ -105,18 +118,32 @@ def parse_arguments():
                     help='Steps sampling random actions (default: 4000)')
     parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
                     help='Value target update interval (default: 1)')
-    parser.add_argument('--replay_size', type=int, default=200000, metavar='N',
-                    help='Size of replay buffer (default: 200000)')
+    parser.add_argument('--replay_size', type=int, default=100_000, metavar='N',
+                    help='Size of replay buffer (default: 100_000)')
     parser.add_argument('--cuda', action="store_true",
                     help='Run on CUDA (default: False)')
     parser.add_argument('--save-curve', action="store_true",
                     help='Save learning curve plot (default: False)')
     parser.add_argument('--curve-name', type=str, default='learning_curve',
                     help='Filename for learning curve plot (default: learning_curve)')
+    parser.add_argument('--memory-efficient', action="store_true", default=True,
+                    help='Enable memory efficiency optimizations (default: True)')
+    parser.add_argument('--checkpoint-interval', type=int, default=20,
+                    help='Checkpoint save interval in episodes (default: 20)')
+    parser.add_argument('--gc-interval', type=int, default=50,
+                    help='Garbage collection interval in episodes (default: 50)')
+    parser.add_argument('--eval-episodes', type=int, default=10,
+                    help='Number of episodes for evaluation (default: 10)')
+    parser.add_argument('--eval-interval', type=int, default=50,
+                    help='Evaluation interval in episodes (default: 50)')
+    parser.add_argument('--log-interval', type=int, default=5,
+                    help='Logging interval in episodes (default: 5)')
+    parser.add_argument('--num-episodes', type=int, default=1000,
+                help='Maximum number of episodes (default: 1000)')
     return parser.parse_args()
 
 def main():
-    """Main training function"""
+    """Main training function with memory optimization and progress bar"""
     # Parse arguments
     args = parse_arguments()
     
@@ -127,11 +154,7 @@ def main():
     # Initialize ROS2
     rclpy.init(args=None)
     
-    # Create images for visualization and collision detection
-    global_vars.image = np.zeros((image_size, image_size, 3), np.uint8)
-    global_vars.image_for_clash_calc = np.zeros((image_size, image_size), np.uint8)
-    
-    # Initialize environment and subscribers
+    # Create environment and subscribers
     env = DDEnv(my_world, simulation_context, image_size, pixel_to_meter,
                stage_width, stage_height, wheelbase, global_vars.image, global_vars.image_for_clash_calc)
     
@@ -157,29 +180,47 @@ def main():
     # Initialize SAC agent
     agent = SAC(len(env.current_state), action_space, args)
     
-    # Set up TensorBoard writer
-    writer = SummaryWriter('runs/{}_SAC_{}_{}_{}'.format(
-        datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-        args.env_name,
-        args.policy,
-        "autotune" if args.automatic_entropy_tuning else ""))
+    # Configure device
+    device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        # Set GPU memory limits if using CUDA
+        if args.memory_efficient:
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Use only 80% of GPU memory
+    else:
+        print("Using CPU")
     
-    # Initialize replay memory
-    memory = ReplayMemory(args.replay_size, args.seed)
+    # Set up TensorBoard writer with reduced flush frequency to minimize I/O
+    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.env_name}_{args.policy}'
+    writer = SummaryWriter(log_dir, max_queue=1000, flush_secs=120)
+    
+    # Create replay memory with state and action dimensions
+    state_dim = len(env.current_state)
+    action_dim = action_space.shape[0]
+    memory = ReplayMemory(args.replay_size, state_dim, action_dim, args.seed)
     
     # Training loop parameters
     total_numsteps = 0
     updates = 0
     max_episode_steps = 120
     
-    # Lists to store metrics for learning curve
+    # Lists to store metrics for learning curve (using NumPy arrays for efficiency)
     episode_rewards = []
     episode_numbers = []
     eval_rewards = []
     eval_episode_numbers = []
     
+    # Initialize progress bar for total training
+    from tqdm import tqdm
+    progress_bar = tqdm(total=args.num_steps, desc="Training Progress", unit="steps")
+    last_update = 0
+    
     try:
         for i_episode in itertools.count(1):
+            # Run garbage collection periodically to free memory
+            if i_episode % args.gc_interval == 0:
+                collect_garbage()
+            
             episode_reward = 0
             episode_steps = 0
             done = False
@@ -187,28 +228,36 @@ def main():
             # Reset environment
             state = env.reset()
             
+            # Episode loop
             while not done:
-                print(f"Episode step: {episode_steps}, Total steps: {total_numsteps}/{args.num_steps}")
-                
                 # Select action based on exploration strategy
                 if args.start_steps > total_numsteps:
-                    action = 2 * np.random.rand(1) - 1  # Random action [-1, 1]
+                    # Random action [-1, 1] - use numpy for efficiency
+                    action = np.random.uniform(-1, 1, (1,)).astype(np.float32)
                 else:
-                    action = agent.select_action(state)  # Sample action from policy
+                    # Sample action from policy - with no_grad() to save memory
+                    with torch.no_grad():
+                        action = agent.select_action(state)
                 
-                # Perform updates if enough samples in memory
+                # Perform updates if enough samples in memory - with memory optimizations
                 if len(memory) > args.batch_size:
-                    for i in range(args.updates_per_step):
-                        # Update agent parameters
-                        critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(
-                            memory, args.batch_size, updates)
+                    # Limit updates to reduce memory pressure during exploration
+                    max_updates = min(args.updates_per_step, 5 if total_numsteps < 50000 else 10)
+                    
+                    for i in range(max_updates):
+                        # Update agent parameters - wrap in no_grad for critic evaluation
+                        with torch.set_grad_enabled(True):
+                            critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(
+                                memory, args.batch_size, updates)
                         
-                        # Log metrics
-                        writer.add_scalar('loss/critic_1', critic_1_loss, updates)
-                        writer.add_scalar('loss/critic_2', critic_2_loss, updates)
-                        writer.add_scalar('loss/policy', policy_loss, updates)
-                        writer.add_scalar('loss/entropy_loss', ent_loss, updates)
-                        writer.add_scalar('entropy_temperature/alpha', alpha, updates)
+                        # Log metrics only periodically to reduce overhead
+                        if updates % 100 == 0:
+                            writer.add_scalar('loss/critic_1', critic_1_loss, updates)
+                            writer.add_scalar('loss/critic_2', critic_2_loss, updates)
+                            writer.add_scalar('loss/policy', policy_loss, updates)
+                            writer.add_scalar('loss/entropy_loss', ent_loss, updates)
+                            writer.add_scalar('entropy_temperature/alpha', alpha, updates)
+                        
                         updates += 1
                 
                 # Take a step in the environment
@@ -217,6 +266,16 @@ def main():
                 episode_steps += 1
                 total_numsteps += 1
                 episode_reward += reward
+                
+                # Update progress bar
+                if total_numsteps > last_update:
+                    progress_bar.update(total_numsteps - last_update)
+                    progress_bar.set_postfix({
+                        'episode': i_episode,
+                        'ep_steps': episode_steps,
+                        'reward': f"{episode_reward:.2f}"
+                    })
+                    last_update = total_numsteps
                 
                 # Handle the "done" signal properly for terminal vs time-limit cases
                 mask = 1 if episode_steps == max_episode_steps else float(not done)
@@ -230,73 +289,98 @@ def main():
                 # Break if we've reached the step limit
                 if total_numsteps > args.num_steps:
                     break
-
-            # Log episode metrics
-            writer.add_scalar('reward/train', episode_reward, i_episode)
-            print("Episode: {}, Total steps: {}, Episode steps: {}, Reward: {}".format(
-                i_episode, total_numsteps, episode_steps, round(episode_reward, 2)))
-                            
-            # Store training metrics for learning curve
+            
+            # Log episode metrics - only log periodically to reduce I/O
+            if i_episode % args.log_interval == 0:
+                writer.add_scalar('reward/train', episode_reward, i_episode)
+                
+            # Store training metrics for learning curve (convert to NumPy array at the end)
             episode_rewards.append(episode_reward)
             episode_numbers.append(i_episode)
             
-            # Clear CUDA cache for memory management
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()            
-            
-            # Evaluation phase
-            if i_episode % 10 == 0 and args.eval:
-                avg_reward = 0.
-                episodes = 10
-                for i in range(episodes):
-                    print(f"Evaluation episode {i}")
-                    state = env.reset()
-                    episode_reward = 0
-                    eval_steps = 0
-                    done = False
-                    while not done:
-                        action = agent.select_action(state, evaluate=True)
-                        # Modified to match the main training loop
-                        next_state, reward, done = env.step(action, eval_steps, max_episode_steps)
-                        
-                        episode_reward += reward
-                        eval_steps += 1
-                        state = next_state
-                    avg_reward += episode_reward
-                avg_reward /= episodes
+            # Evaluation phase - only run periodically to reduce overhead
+            if i_episode % args.eval_interval == 0 and args.eval:
+                # Temporarily pause the progress bar to display evaluation message
+                progress_bar.set_description("Evaluating...")
+                
+                # Run evaluation episodes
+                eval_rewards_batch = []
+                for eval_ep in range(args.eval_episodes):
+                    eval_reward = evaluate_policy(agent, env, max_episode_steps, eval_ep)
+                    eval_rewards_batch.append(eval_reward)
+                
+                # Calculate average reward
+                avg_reward = np.mean(eval_rewards_batch)
                 
                 writer.add_scalar('avg_reward/test', avg_reward, i_episode)
-                print("----------------------------------------")
-                print("Test Episodes: {}, Avg. Reward: {}".format(episodes, round(avg_reward, 2)))
-                print("----------------------------------------")
-
+                progress_bar.write(f"Evaluation: {args.eval_episodes} episodes, Avg. Reward: {avg_reward:.2f}")
+                
                 # Store evaluation metrics for learning curve
                 eval_rewards.append(avg_reward)
                 eval_episode_numbers.append(i_episode)
-
-                # Clear CUDA cache for memory management
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                
+                # Run garbage collection after evaluation
+                collect_garbage()
+                
+                # Reset progress bar description
+                progress_bar.set_description("Training Progress")
             
             # Save model checkpoint periodically
-            if i_episode % 20 == 0:
+            if i_episode % args.checkpoint_interval == 0:
                 agent.save_checkpoint(args.env_name, suffix=str(i_episode))
+                
+                # Also save replay buffer occasionally for potential resume
+                if i_episode % (args.checkpoint_interval * 5) == 0:
+                    memory.save_buffer(args.env_name, suffix=str(i_episode))
             
             # Break if we've completed all steps
             if total_numsteps > args.num_steps:
                 break
                 
     except KeyboardInterrupt:
-        print("Training interrupted by user")
+        progress_bar.write("\nTraining interrupted by user")
     finally:
+        # Close progress bar
+        progress_bar.close()
+        
+        # Final save
+        final_episode = i_episode if 'i_episode' in locals() else 0
+        if final_episode > 0:
+            print(f"Saving final checkpoint at episode {final_episode}")
+            agent.save_checkpoint(args.env_name, suffix=f"final_{final_episode}")
+            memory.save_buffer(args.env_name, suffix=f"final_{final_episode}")
+        
         # Clean up
         writer.close()
         
         # Save learning curve if requested
         if args.save_curve and episode_numbers:
-            save_learning_curve(episode_numbers, episode_rewards, 
-                               eval_episode_numbers, eval_rewards, args.curve_name)
+            # Convert lists to NumPy arrays for efficient processing
+            episode_numbers_np = np.array(episode_numbers)
+            episode_rewards_np = np.array(episode_rewards)
+            
+            eval_episode_numbers_np = np.array(eval_episode_numbers) if eval_episode_numbers else None
+            eval_rewards_np = np.array(eval_rewards) if eval_rewards else None
+            
+            save_learning_curve(episode_numbers_np, episode_rewards_np, 
+                               eval_episode_numbers_np, eval_rewards_np, args.curve_name)
         
+        # Final cleanup
+        collect_garbage()
         print("Training finished")
+
 if __name__ == "__main__":
+    # Set lower memory usage for numpy operations
+    np.set_printoptions(precision=4, suppress=True, linewidth=120)
+    
+    # Set up environment variables to limit CPU utilization if needed
+    os.environ['OMP_NUM_THREADS'] = '4'  # Limit OpenMP threads
+    os.environ['MKL_NUM_THREADS'] = '4'  # Limit MKL threads
+    
+    # Set CUDA options to optimize memory usage
+    if torch.cuda.is_available():
+        # Try to ensure PyTorch releases memory after operations
+        torch.cuda.empty_cache()
+        
+    # Run main function
     main()
