@@ -116,6 +116,7 @@ def evaluate_policy(agent, env, max_eval_episodes=10, max_steps=1000, seed=None)
 def evaluate_policy_vec(agent, vec_env, max_eval_episodes=10, max_steps=1000, seed=None):
     """
     Evaluate the agent's policy in vectorized environments for faster evaluation.
+    Fixed version that handles potential empty state arrays.
     
     Args:
         agent: Agent to evaluate
@@ -141,7 +142,7 @@ def evaluate_policy_vec(agent, vec_env, max_eval_episodes=10, max_steps=1000, se
         episode_rewards = []
         
         # Reset all environments
-        states = vec_env.reset()
+        states, _ = vec_env.reset(seed=seed)
         
         # Track which environments have finished their episodes
         env_dones = [False] * num_envs
@@ -150,49 +151,53 @@ def evaluate_policy_vec(agent, vec_env, max_eval_episodes=10, max_steps=1000, se
         
         # Run until we collect max_eval_episodes episodes
         while len(episode_rewards) < max_eval_episodes:
-            # Select actions for all environments
-            actions = agent.select_actions_vec(states, evaluate=True)
-            
-            # For discrete action spaces, convert actions to integers
-            if isinstance(vec_env.action_space, gym.spaces.Discrete):
-                if actions.ndim == 2 and actions.shape[1] == 1:
-                    # If actions are in shape (num_envs, 1), convert to (num_envs,)
-                    actions = actions.squeeze(-1).astype(np.int32)
-                elif actions.ndim == 1:
-                    # If already in shape (num_envs,), ensure integer type
-                    actions = actions.astype(np.int32)
-            
-            # Step all environments
-            next_states, rewards, dones, infos = vec_env.step(actions)
-            
-            # Update states and steps
-            for env_idx in range(num_envs):
-                # Skip environments that have already completed their episodes
-                if env_dones[env_idx]:
-                    continue
+            # Select actions for all active environments
+            if any(not done for done in env_dones):  # Only process if any environment is active
+                # Create a mask for active environments
+                active_env_indices = [i for i, done in enumerate(env_dones) if not done]
+                active_states = states[active_env_indices]
                 
-                # Update rewards and steps
-                env_rewards[env_idx] += rewards[env_idx]
-                env_steps[env_idx] += 1
-                
-                # Check for episode termination
-                if dones[env_idx] or env_steps[env_idx] >= max_steps:
-                    episode_rewards.append(env_rewards[env_idx])
-                    env_dones[env_idx] = True
+                if len(active_states) > 0:  # Ensure we have states to process
+                    # Get actions only for active environments
+                    all_actions = np.zeros((num_envs,) + vec_env.single_action_space.shape, dtype=np.float32)
+                    active_actions = agent.select_actions_vec(active_states, evaluate=True)
                     
-                    # Reset this environment if we need more episodes
-                    if len(episode_rewards) < max_eval_episodes:
-                        # Reset just this environment's tracking variables
-                        env_rewards[env_idx] = 0
-                        env_steps[env_idx] = 0
-                        env_dones[env_idx] = False
-            
-            # Update states for next iteration
-            states = next_states
+                    # Place active actions in the correct indices
+                    for idx, action in zip(active_env_indices, active_actions):
+                        all_actions[idx] = action
+                    
+                    # Step all environments
+                    next_states, rewards, terminations, truncations, infos = vec_env.step(all_actions)
+                    dones = np.logical_or(terminations, truncations)
+                    
+                    # Update states and steps
+                    for env_idx in range(num_envs):
+                        # Skip environments that have already completed their episodes
+                        if env_dones[env_idx]:
+                            continue
+                        
+                        # Update rewards and steps
+                        env_rewards[env_idx] += rewards[env_idx]
+                        env_steps[env_idx] += 1
+                        
+                        # Check for episode termination
+                        if dones[env_idx] or env_steps[env_idx] >= max_steps:
+                            episode_rewards.append(env_rewards[env_idx])
+                            env_dones[env_idx] = True
+                            
+                            # Reset this environment if we need more episodes
+                            if len(episode_rewards) < max_eval_episodes:
+                                # Reset just this environment's tracking variables
+                                env_rewards[env_idx] = 0
+                                env_steps[env_idx] = 0
+                                env_dones[env_idx] = False
+                    
+                    # Update states for next iteration
+                    states = next_states
             
             # If all environments are done, reset all
             if all(env_dones) and len(episode_rewards) < max_eval_episodes:
-                states = vec_env.reset()
+                states, _ = vec_env.reset(seed=seed)
                 env_dones = [False] * num_envs
                 env_rewards = [0] * num_envs
                 env_steps = [0] * num_envs

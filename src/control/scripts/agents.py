@@ -128,6 +128,11 @@ class SAC(object):
         Returns:
             numpy.ndarray: Batch of selected actions
         """
+        # Handle empty states case (can happen during evaluation)
+        if states.size == 0 or len(states.shape) < 2:
+            return np.array([])
+        
+        # Convert to tensor
         states = torch.FloatTensor(states).to(self.device)
         
         with torch.no_grad():

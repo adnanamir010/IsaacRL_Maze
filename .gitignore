@@ -1,1 +1,3 @@
 src/control/scripts/checkpoints/
+src/control/scripts/__pycache__/
+src/control/scripts/runs/

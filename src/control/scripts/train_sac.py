@@ -13,23 +13,14 @@ from tqdm import tqdm
 from agents import SAC
 from memory import ReplayMemory
 from rl_utils import evaluate_policy, evaluate_policy_vec, save_learning_curve, collect_garbage
-from environment import make_vec_env
+from environment import VectorizedDDEnv, make_vectorized_env
 from torch.utils.tensorboard import SummaryWriter
-
-# Try to import the gym-navigation environment
-try:
-    import gym_navigation
-except ImportError:
-    print("Warning: gym-navigation not found. Please install it using:")
-    print("pip install git+https://github.com/ngeramanis/gym-navigation.git")
 
 def parse_arguments():
     """Parse command line arguments for the SAC algorithm"""
     parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
-    parser.add_argument('--env-name', default="gym_navigation:NavigationGoal-v0",
-                    help='Environment name (default: gym_navigation:NavigationGoal-v0)')
-    parser.add_argument('--track-id', type=int, default=2,
-                    help='Track ID for NavigationGoal environment (default: 2)')
+    parser.add_argument('--env-name', default="VectorizedDD",
+                    help='Environment name (default: VectorizedDD)')
     parser.add_argument('--policy', default="Gaussian",
                     help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
     parser.add_argument('--eval', type=bool, default=True,
@@ -51,15 +42,15 @@ def parse_arguments():
     parser.add_argument('--num_steps', type=int, default=1_000_000, metavar='N',
                     help='Maximum number of steps (default: 1_000_000)')
     parser.add_argument('--hidden_size', type=int, default=128, metavar='N',
-                    help='Hidden size (default: 256)')
+                    help='Hidden size (default: 128)')
     parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
                     help='Model updates per simulator step (default: 1)')
     parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
                     help='Steps sampling random actions (default: 10000)')
     parser.add_argument('--target_update_interval', type=int, default=10, metavar='N',
                     help='Value target update interval (default: 10)')
-    parser.add_argument('--replay_size', type=int, default=200_000, metavar='N',
-                    help='Size of replay buffer (default: 200_000)')
+    parser.add_argument('--replay_size', type=int, default=500_000, metavar='N',
+                    help='Size of replay buffer (default: 500_000)')
     parser.add_argument('--cuda', action="store_true", default=True,
                     help='Run on CUDA (default: True)')
     parser.add_argument('--save-curve', action="store_true", default=True,
@@ -68,8 +59,8 @@ def parse_arguments():
                     help='Filename for learning curve plot (default: sac_vec_learning_curve)')
     parser.add_argument('--memory-efficient', action="store_true", default=True,
                     help='Enable memory efficiency optimizations (default: True)')
-    parser.add_argument('--checkpoint-interval', type=int, default=20,
-                    help='Checkpoint save interval in episodes (default: 20)')
+    parser.add_argument('--checkpoint-interval', type=int, default=50,
+                    help='Checkpoint save interval in episodes (default: 50)')
     parser.add_argument('--gc-interval', type=int, default=50,
                     help='Garbage collection interval in episodes (default: 50)')
     parser.add_argument('--eval-episodes', type=int, default=10,
@@ -78,8 +69,10 @@ def parse_arguments():
                     help='Evaluation interval in episodes (default: 20)')
     parser.add_argument('--log-interval', type=int, default=10,
                     help='Logging interval in episodes (default: 10)')
-    parser.add_argument('--num-envs', type=int, default=1,
-                    help='Number of parallel environments (default: 1)')
+    parser.add_argument('--num-envs', type=int, default=4,
+                    help='Number of parallel environments (default: 4)')
+    parser.add_argument('--render', action="store_true",
+                    help='Render visualization (only for training with num-envs=1) (default: False)')
 
     return parser.parse_args()
 
@@ -103,35 +96,53 @@ def main():
         print("Using CPU")
     
     # Create vectorized environments
-    print(f"Creating {args.num_envs} parallel environments for '{args.env_name}' with track_id {args.track_id}")
-    vec_env = make_vec_env(env_id=args.env_name, num_envs=args.num_envs, seed=args.seed, track_id=args.track_id)
+    print(f"Creating {args.num_envs} parallel environments for '{args.env_name}'")
     
-    # Create a single environment for evaluation
-    eval_env = make_vec_env(env_id=args.env_name, num_envs=1, seed=args.seed + 100, track_id=args.track_id)
+    # Initialize render mode only if explicitly requested and only with a single environment
+    render_mode = "human" if args.render and args.num_envs == 1 else None
+    if args.render and args.num_envs > 1:
+        print("Warning: Rendering is only supported for single environment training. Disabling rendering.")
+    
+    if args.env_name == "VectorizedDD":
+        # Use our custom environment
+        if args.num_envs == 1 and render_mode:
+            # Single environment with rendering
+            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode)
+            vec_env = gym.vector.SyncVectorEnv([env_fn])
+        else:
+            # Multiple environments or no rendering
+            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed)
+        
+        # Create a single environment for evaluation
+        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100)
+    else:
+        # Use standard Gym environment
+        vec_env = gym.vector.make(args.env_name, num_envs=args.num_envs, asynchronous=False)
+        eval_env = gym.vector.make(args.env_name, num_envs=1, asynchronous=False)
     
     # Get state and action dimensions
-    state_dim = vec_env.observation_space.shape[0] if hasattr(vec_env.observation_space, 'shape') else vec_env.observation_space.n
+    state_dim = vec_env.single_observation_space.shape[0]
     
     # Handle different types of action spaces
-    if isinstance(vec_env.action_space, gym.spaces.Box):
-        action_dim = vec_env.action_space.shape[0]
+    if isinstance(vec_env.single_action_space, gym.spaces.Box):
+        action_dim = vec_env.single_action_space.shape[0]
         print(f"Continuous action space detected with {action_dim} dimensions")
-    elif isinstance(vec_env.action_space, gym.spaces.Discrete):
+    elif isinstance(vec_env.single_action_space, gym.spaces.Discrete):
         action_dim = 1  # Discrete action is represented as a single integer
-        print(f"Discrete action space detected with {vec_env.action_space.n} possible actions")
+        print(f"Discrete action space detected with {vec_env.single_action_space.n} possible actions")
     else:
-        raise ValueError(f"Unsupported action space type: {type(vec_env.action_space)}")
+        raise ValueError(f"Unsupported action space type: {type(vec_env.single_action_space)}")
         
     print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
     
     # Set up action space
-    action_space = vec_env.action_space
+    action_space = vec_env.single_action_space
     
     # Initialize SAC agent
     agent = SAC(state_dim, action_space, args)
     
     # Set up TensorBoard writer with reduced flush frequency to minimize I/O
-    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.env_name.split(":")[-1]}_track{args.track_id}_vec{args.num_envs}'
+    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.env_name}_vec{args.num_envs}'
     writer = SummaryWriter(log_dir, max_queue=1000, flush_secs=120)
     
     # Create replay memory with state and action dimensions
@@ -157,7 +168,7 @@ def main():
     last_update = 0
     
     # Reset environments to get initial states
-    states = vec_env.reset()
+    states, _ = vec_env.reset(seed=args.seed)
     
     try:
         while total_numsteps < args.num_steps:
@@ -168,17 +179,17 @@ def main():
             # Select actions
             if total_numsteps < args.start_steps:
                 # Sample random actions for initial exploration
-                if isinstance(vec_env.action_space, gym.spaces.Discrete):
+                if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
                     # For discrete action space
-                    actions = np.array([vec_env.action_space.sample() for _ in range(args.num_envs)])
+                    actions = np.array([vec_env.single_action_space.sample() for _ in range(args.num_envs)])
                 else:
                     # For continuous action space
-                    actions = np.array([vec_env.action_space.sample() for _ in range(args.num_envs)])
+                    actions = np.array([vec_env.single_action_space.sample() for _ in range(args.num_envs)])
             else:
                 # Sample actions from policy
                 actions = agent.select_actions_vec(states, evaluate=False)
 
-            if isinstance(vec_env.action_space, gym.spaces.Discrete):
+            if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
                 # Convert from array form [n] to scalar form n
                 if isinstance(actions, np.ndarray):
                     if actions.ndim == 2 and actions.shape[1] == 1:
@@ -189,7 +200,10 @@ def main():
                         actions = actions.astype(np.int32)
                 
             # Take steps in environments
-            next_states, rewards, dones, infos = vec_env.step(actions)
+            next_states, rewards, terminations, truncations, infos = vec_env.step(actions)
+            
+            # Combine terminations and truncations
+            dones = np.logical_or(terminations, truncations)
             
             # Collect transitions in replay buffer
             for i in range(args.num_envs):
@@ -200,7 +214,7 @@ def main():
                 mask = 0.0 if terminal_done else 1.0  # Terminal state = 0, non-terminal = 1
                 
                 # Store transition in replay memory
-                if isinstance(vec_env.action_space, gym.spaces.Discrete):
+                if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
                     # Convert discrete action to one-hot vector or keep as scalar
                     discrete_action = actions[i]
                     memory.push(states[i], np.array([discrete_action]), rewards[i], next_states[i], mask)
@@ -256,11 +270,11 @@ def main():
                     
                     # Save model checkpoint periodically
                     if episode_count % args.checkpoint_interval == 0:
-                        agent.save_checkpoint(args.env_name.split(":")[-1], suffix=f"track{args.track_id}_{episode_count}")
+                        agent.save_checkpoint(args.env_name, suffix=f"{episode_count}")
                         
                         # Also save replay buffer occasionally for potential resume
                         if episode_count % (args.checkpoint_interval * 5) == 0:
-                            memory.save_buffer(args.env_name.split(":")[-1], suffix=f"track{args.track_id}_{episode_count}")
+                            memory.save_buffer(args.env_name, suffix=f"{episode_count}")
             
             # Perform updates if enough samples in memory
             if len(memory) > args.batch_size:
@@ -301,8 +315,8 @@ def main():
         # Final save
         if 'episode_count' in locals() and episode_count > 0:
             print(f"Saving final checkpoint at episode {episode_count}")
-            agent.save_checkpoint(args.env_name.split(":")[-1], suffix=f"track{args.track_id}_final_{episode_count}")
-            memory.save_buffer(args.env_name.split(":")[-1], suffix=f"track{args.track_id}_final_{episode_count}")
+            agent.save_checkpoint(args.env_name, suffix=f"final_{episode_count}")
+            memory.save_buffer(args.env_name, suffix=f"final_{episode_count}")
         
         # Clean up
         writer.close()
