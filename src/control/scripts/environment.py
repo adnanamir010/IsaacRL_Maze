@@ -1,442 +1,491 @@
 import numpy as np
-import math
-import cv2
-from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
-from omni.isaac.core.prims import XFormPrim
-from pxr import UsdGeom
-import global_vars
-import os
-import weakref
+import gymnasium as gym
+import threading
+import multiprocessing as mp
+from multiprocessing import Process, Pipe
+from abc import ABC, abstractmethod
 
-class DDEnv(Node):
+class VecEnv(ABC):
     """
-    Memory-optimized robot environment for Differential Drive in Isaac Sim.
-    This environment simulates a robot navigating through obstacles to reach a goal.
+    An abstract asynchronous, vectorized environment.
     """
-    def __init__(self, world, simulation_context, image_size, pixel_to_meter,
-                 stage_width, stage_height, wheelbase, img, img_for_clash_calc):
-        """
-        Initialize the robot environment with explicit dependencies.
-        """
-        super().__init__('environment')
-        
-        # Store passed references - use weakref for objects that may have circular references
-        self.world = weakref.ref(world)
-        self.simulation_context = weakref.ref(simulation_context)
-        self.stage_width = stage_width
-        self.stage_height = stage_height
-        self.wheelbase = wheelbase
-        self.pixel_to_meter = pixel_to_meter
-        
-        # Initialize global variables - create memory-mapped arrays
-        self._setup_memmapped_images(image_size, img, img_for_clash_calc)
-
-        # Robot control parameters
-        self.steering_angle = np.zeros(2, dtype=np.float32)  # left, right knuckle positions
-        self.wheel_speed = np.zeros(2, dtype=np.float32)     # left, right wheel velocities
-        
-        # Publishers for robot control
-        self.steering_publisher = self.create_publisher(Float64MultiArray, '/controller/cmd_pos', 10)
-        self.velocity_publisher = self.create_publisher(Float64MultiArray, '/controller/cmd_vel', 10)
-
-        # Robot physical parameters
-        self.track_width = 1.1   # Track width between wheels
-        self.wheelbase = 1.8     # Wheelbase length
-        self.wheel_radius = 0.3  # Wheel radius
-        
-        # State representation
-        self.current_state = np.zeros(22, dtype=np.float32)  # 0-19: lidar readings, 20-21: goal distance (x,y)
-        
-        # Environment parameters
-        self.goal_position = np.array([24.0, -24.0], dtype=np.float32)
-        self.linear_velocity = 3.0     # Forward velocity of the robot
-        self.angular_velocity = 0.0    # Angular velocity of the robot
-        self.obstacle_size = 8.0
-        self.prev_distance = 0.0       # Previous distance to goal for reward calculation
-        self.done = False
-        
-        # Create obstacles (cubes) - store references efficiently
-        self.cube_transforms = self._create_cube_transforms()
-        self._initialize_cube_geometry()
+    def __init__(self, num_envs, observation_space, action_space):
+        self.num_envs = num_envs
+        self.observation_space = observation_space
+        self.action_space = action_space
     
-    def _setup_memmapped_images(self, image_size, img, img_for_clash_calc):
-        """Create memory-mapped arrays for images instead of in-memory arrays"""
-        # Create temp directory if it doesn't exist
-        os.makedirs('temp', exist_ok=True)
+    @abstractmethod
+    def reset(self):
+        """
+        Reset all environments and return observations.
         
-        # Define memmap files
-        image_file = 'temp/environment_image.dat'
-        clash_image_file = 'temp/clash_image.dat'
+        Returns:
+            numpy.ndarray: Observations
+        """
+        pass
+    
+    @abstractmethod
+    def step_async(self, actions):
+        """
+        Asynchronously step in all environments.
         
-        # If passed existing images, we'll copy their data
-        has_existing_data = (img is not None and img_for_clash_calc is not None)
+        Args:
+            actions: Actions to take in each environment
+        """
+        pass
+    
+    @abstractmethod
+    def step_wait(self):
+        """
+        Wait for the step taken with step_async().
         
-        # Create memory-mapped arrays
+        Returns:
+            tuple: (observations, rewards, dones, infos)
+        """
+        pass
+    
+    def step(self, actions):
+        """
+        Step in all environments.
+        
+        Args:
+            actions: Actions to take in each environment
+            
+        Returns:
+            tuple: (observations, rewards, dones, infos)
+        """
+        self.step_async(actions)
+        return self.step_wait()
+    
+    @abstractmethod
+    def close(self):
+        """
+        Close all environments.
+        """
+        pass
+    
+    def seed(self, seed=None):
+        """
+        Set random seeds for all environments.
+        
+        Args:
+            seed: Initial seed
+            
+        Returns:
+            list: List of seeds
+        """
+        pass
+
+
+class CloudpickleWrapper:
+    """
+    Uses cloudpickle to serialize contents (otherwise multiprocessing tries to use pickle).
+    """
+    def __init__(self, var):
+        self.var = var
+    
+    def __getstate__(self):
+        import cloudpickle
+        return cloudpickle.dumps(self.var)
+    
+    def __setstate__(self, ob):
+        import pickle
+        self.var = pickle.loads(ob)
+
+
+def worker(remote, parent_remote, env_fn_wrapper):
+    """
+    Worker function for a subprocess.
+    
+    Args:
+        remote: Process connection for communication with the main process
+        parent_remote: Other end of the pipe, to be closed
+        env_fn_wrapper: CloudpickleWrapper containing the environment creation function
+    """
+    parent_remote.close()
+    env = env_fn_wrapper.var()
+    
+    while True:
         try:
-            if has_existing_data:
-                # Copy existing data
-                image = np.memmap(image_file, dtype=np.uint8, mode='w+', 
-                                 shape=(image_size, image_size, 3))
-                image_for_clash_calc = np.memmap(clash_image_file, dtype=np.uint8, mode='w+',
-                                              shape=(image_size, image_size))
+            cmd, data = remote.recv()
+            
+            if cmd == 'step':
+                # Gymnasium uses tuple with truncated flag
+                result = env.step(data)
+                if len(result) == 5:  # Gymnasium format: obs, reward, terminated, truncated, info
+                    ob, reward, terminated, truncated, info = result
+                    done = terminated or truncated
+                else:  # Old gym format: obs, reward, done, info
+                    ob, reward, done, info = result
                 
-                # Copy data if available
-                np.copyto(image, img)
-                np.copyto(image_for_clash_calc, img_for_clash_calc)
+                if done:
+                    # Gymnasium reset returns (obs, info)
+                    try:
+                        result = env.reset()
+                        if isinstance(result, tuple):  # Gymnasium reset
+                            ob, _ = result
+                        else:  # Old gym reset
+                            ob = result
+                    except TypeError:
+                        # Fallback for older gym versions
+                        ob = env.reset()
+                
+                remote.send((ob, reward, done, info))
+            
+            elif cmd == 'reset':
+                # Gymnasium reset returns (obs, info)
+                try:
+                    result = env.reset()
+                    if isinstance(result, tuple):  # Gymnasium reset
+                        ob, _ = result
+                    else:  # Old gym reset
+                        ob = result
+                except TypeError:
+                    # Fallback for older gym versions
+                    ob = env.reset()
+                
+                remote.send(ob)
+            
+            elif cmd == 'close':
+                remote.close()
+                break
+            
+            elif cmd == 'get_spaces':
+                remote.send((env.observation_space, env.action_space))
+            
+            elif cmd == 'seed':
+                # Handle different seeding methods between gym versions
+                try:
+                    # Modern Gymnasium way - seed in reset
+                    _ = env.reset(seed=data)
+                    remote.send([data])  # Just return the seed we used
+                except (TypeError, ValueError):
+                    try:
+                        # Older gym way - explicit seed method
+                        res = env.seed(data)
+                        remote.send(res if res is not None else [data])
+                    except (AttributeError, TypeError):
+                        # No seeding capability
+                        remote.send([data if data is not None else 0])
+            
             else:
-                # Create new empty arrays
-                image = np.memmap(image_file, dtype=np.uint8, mode='w+', 
-                                 shape=(image_size, image_size, 3))
-                image_for_clash_calc = np.memmap(clash_image_file, dtype=np.uint8, mode='w+',
-                                              shape=(image_size, image_size))
+                raise NotImplementedError(f"Unknown command: {cmd}")
                 
-                # Initialize with zeros
-                image.fill(0)
-                image_for_clash_calc.fill(0)
+        except EOFError:
+            break
+
+
+class SubprocVecEnv(VecEnv):
+    """
+    VecEnv that runs multiple environments in subprocesses.
+    """
+    def __init__(self, env_fns, context=None):
+        """
+        Initialize a SubprocVecEnv.
+        
+        Args:
+            env_fns: List of functions that create environments
+            context: Multiprocessing context
+        """
+        self.waiting = False
+        self.closed = False
+        
+        if context is None:
+            context = mp.get_context()
+        
+        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(len(env_fns))])
+        self.processes = []
+        
+        for work_remote, remote, env_fn in zip(self.work_remotes, self.remotes, env_fns):
+            args = (work_remote, remote, CloudpickleWrapper(env_fn))
+            process = Process(target=worker, args=args, daemon=True)
+            process.start()
+            self.processes.append(process)
+            work_remote.close()
+        
+        self.remotes[0].send(('get_spaces', None))
+        observation_space, action_space = self.remotes[0].recv()
+        
+        VecEnv.__init__(self, len(env_fns), observation_space, action_space)
+        
+    def step_async(self, actions):
+        """
+        Asynchronously step in all environments.
+        
+        Args:
+            actions: Actions to take in each environment
+        """
+        for remote, action in zip(self.remotes, actions):
+            remote.send(('step', action))
+        self.waiting = True
+        
+    def step_wait(self):
+        """
+        Wait for the step taken with step_async().
+        
+        Returns:
+            tuple: (observations, rewards, dones, infos)
+        """
+        results = [remote.recv() for remote in self.remotes]
+        self.waiting = False
+        
+        # Transpose the results
+        obs, rews, dones, infos = zip(*results)
+        
+        # Make sure observations are properly formatted as numpy arrays
+        if isinstance(obs[0], np.ndarray):
+            obs = np.stack(obs)
+        else:
+            # Handle other observation types (e.g., dict observations)
+            pass
+            
+        return obs, np.stack(rews), np.stack(dones), infos
+    
+    def reset(self):
+        """
+        Reset all environments and return observations.
+        
+        Returns:
+            numpy.ndarray: Observations
+        """
+        for remote in self.remotes:
+            remote.send(('reset', None))
+        
+        obs = [remote.recv() for remote in self.remotes]
+        return np.stack(obs)
+    
+    def close(self):
+        """
+        Close all environments.
+        """
+        if self.closed:
+            return
+        
+        if self.waiting:
+            for remote in self.remotes:
+                remote.recv()
+        
+        for remote in self.remotes:
+            remote.send(('close', None))
+        
+        for process in self.processes:
+            process.join()
+            
+        self.closed = True
+        
+    def seed(self, seed=None):
+        """
+        Set random seeds for all environments.
+        
+        Args:
+            seed: Initial seed
+            
+        Returns:
+            list: List of seeds
+        """
+        if seed is None:
+            seed = [None for _ in range(self.num_envs)]
+        elif isinstance(seed, int):
+            seed = [seed + i for i in range(self.num_envs)]
+            
+        for remote, s in zip(self.remotes, seed):
+            remote.send(('seed', s))
+            
+        return [remote.recv() for remote in self.remotes]
+
+
+class DummyVecEnv(VecEnv):
+    """
+    VecEnv that runs multiple environments sequentially in a single process.
+    """
+    def __init__(self, env_fns):
+        """
+        Initialize a DummyVecEnv.
+        
+        Args:
+            env_fns: List of functions that create environments
+        """
+        self.envs = [fn() for fn in env_fns]
+        env = self.envs[0]
+        VecEnv.__init__(self, len(env_fns), env.observation_space, env.action_space)
+        
+        self.actions = None
+        self.closed = False
+        
+    def step_async(self, actions):
+        """
+        Asynchronously step in all environments.
+        
+        Args:
+            actions: Actions to take in each environment
+        """
+        self.actions = actions
+        
+    def step_wait(self):
+        """
+        Wait for the step taken with step_async().
+        
+        Returns:
+            tuple: (observations, rewards, dones, infos)
+        """
+        results = []
+        for env, a in zip(self.envs, self.actions):
+            result = env.step(a)
+            if len(result) == 5:  # Gymnasium format: obs, reward, terminated, truncated, info
+                obs, reward, terminated, truncated, info = result
+                done = terminated or truncated
+                results.append((obs, reward, done, info))
+            else:  # Old gym format: obs, reward, done, info
+                results.append(result)
+        
+        obs, rews, dones, infos = zip(*results)
+        
+        # Handle episode resets
+        new_obs = list(obs)  # Create a mutable copy
+        for i, done in enumerate(dones):
+            if done:
+                # Gymnasium reset returns (obs, info)
+                try:
+                    result = self.envs[i].reset()
+                    if isinstance(result, tuple):  # Gymnasium reset
+                        new_obs[i] = result[0]  # Extract observation
+                    else:  # Old gym reset
+                        new_obs[i] = result
+                except TypeError:
+                    # Fallback for older gym versions
+                    new_obs[i] = self.envs[i].reset()
+        
+        # Make sure observations are properly formatted as numpy arrays
+        if isinstance(new_obs[0], np.ndarray):
+            obs_array = np.stack(new_obs)
+        else:
+            # Handle other observation types (e.g., dict observations)
+            obs_array = new_obs
                 
-            # Update global variables
-            global_vars.image = image
-            global_vars.image_for_clash_calc = image_for_clash_calc
-            
-            # Store references locally
-            self.image_file = image_file
-            self.clash_image_file = clash_image_file
-            
-        except Exception as e:
-            self.get_logger().error(f"Error creating memory-mapped arrays: {e}")
-            # Fall back to regular NumPy arrays if memmapping fails
-            if not has_existing_data:
-                global_vars.image = np.zeros((image_size, image_size, 3), np.uint8)
-                global_vars.image_for_clash_calc = np.zeros((image_size, image_size), np.uint8)
+        return obs_array, np.stack(rews), np.stack(dones), infos
     
-    def _create_cube_transforms(self):
-        """Create transform objects for all obstacle cubes"""
-        transforms = []
-        for i in range(1, 15):  # 14 cubes
-            transforms.append(XFormPrim(prim_path=f"/World/Cube{i}"))
-        return transforms
+    def reset(self):
+        """
+        Reset all environments and return observations.
+        
+        Returns:
+            numpy.ndarray: Observations
+        """
+        obs = []
+        for env in self.envs:
+            # Gymnasium reset returns (obs, info)
+            try:
+                result = env.reset()
+                if isinstance(result, tuple):  # Gymnasium reset
+                    obs.append(result[0])  # Extract observation
+                else:  # Old gym reset
+                    obs.append(result)
+            except TypeError:
+                # Fallback for older gym versions
+                obs.append(env.reset())
+        
+        # Make sure observations are properly formatted as numpy arrays
+        if isinstance(obs[0], np.ndarray):
+            return np.stack(obs)
+        else:
+            # Handle other observation types
+            return obs
     
-    def _initialize_cube_geometry(self):
-        """Initialize the cube geometries for obstacles"""
-        world_ref = self.world()
-        if world_ref is None:
-            self.get_logger().error("World reference is no longer valid")
+    def close(self):
+        """
+        Close all environments.
+        """
+        if self.closed:
             return
             
-        stage = world_ref.stage
+        for env in self.envs:
+            env.close()
+            
+        self.closed = True
         
-        for i, transform in enumerate(self.cube_transforms):
-            # Create cube geometry
-            cube_index = i + 1
-            cube_geom = UsdGeom.Cube.Define(stage, f"/World/Cube{cube_index}/Geom")
-            # Set cube size
-            cube_geom.GetSizeAttr().Set(self.obstacle_size)
-
-    def step(self, action, time_steps, max_episode_steps):
+    def seed(self, seed=None):
         """
-        Execute one step in the environment with memory optimizations.
-        """
-        simulation_context_ref = self.simulation_context()
-        if simulation_context_ref is None:
-            self.get_logger().error("Simulation context reference is no longer valid")
-            return self.current_state, -10, True
-            
-        self.done = False
-        self.angular_velocity = 2 * action[0]
-
-        # Calculate steering angles based on bicycle model - vectorized calculation
-        denominators = np.array([
-            2 * self.linear_velocity - self.angular_velocity * self.track_width,  # left
-            2 * self.linear_velocity + self.angular_velocity * self.track_width   # right
-        ])
+        Set random seeds for all environments.
         
-        # Avoid division by zero
-        mask = (denominators != 0)
-        self.steering_angle = np.zeros(2, dtype=np.float32)
-        self.steering_angle[mask] = np.arctan(self.angular_velocity * self.wheelbase / denominators[mask])
-
-        # Calculate wheel velocities - vectorized
-        self.wheel_speed = np.array([
-            (self.linear_velocity - self.angular_velocity * self.track_width / 2) / self.wheel_radius,
-            (self.linear_velocity + self.angular_velocity * self.track_width / 2) / self.wheel_radius
-        ], dtype=np.float32)
-
-        # Publish control commands
-        wheel_speed_msg = Float64MultiArray(data=self.wheel_speed)    
-        self.velocity_publisher.publish(wheel_speed_msg)  
-        steering_angle_msg = Float64MultiArray(data=self.steering_angle)    
-        self.steering_publisher.publish(steering_angle_msg)  
-
-        # Simulate for multiple steps
-        for _ in range(15):
-            simulation_context_ref.step(render=True)
-
-        # Calculate distance to goal - optimized with numpy
-        pos_diff = np.array([global_vars.body_pose[0] - self.goal_position[0],
-                             global_vars.body_pose[1] - self.goal_position[1]])
-        distance_to_goal = np.linalg.norm(pos_diff)
-
-        # Update state - vectorized operations
-        self.current_state[:20] = global_vars.lidar_data / 30  # Normalize lidar data
-        self.current_state[20:22] = np.array([
-            -(global_vars.body_pose[0] - self.goal_position[0]) / 48,  # Normalized x distance
-            (global_vars.body_pose[1] - self.goal_position[1]) / 48    # Normalized y distance
-        ])
-
-        # Calculate reward and check termination conditions
-        reward = self._calculate_reward(distance_to_goal, global_vars.clash_sum, time_steps, max_episode_steps)
+        Args:
+            seed: Initial seed
+            
+        Returns:
+            list: List of seeds
+        """
+        if seed is None:
+            seed = [None for _ in range(self.num_envs)]
+        elif isinstance(seed, int):
+            seed = [seed + i for i in range(self.num_envs)]
         
-        # Update previous distance for next step
-        self.prev_distance = distance_to_goal
+        seeds = []
+        for i, (env, s) in enumerate(zip(self.envs, seed)):
+            # Try different approaches to setting seed
+            try:
+                # Modern Gymnasium way - seed in reset
+                _ = env.reset(seed=s)
+                seeds.append([s])  # Just return the seed we used
+            except (TypeError, ValueError):
+                try:
+                    # Older gym way - explicit seed method
+                    result = env.seed(s)
+                    seeds.append(result if result is not None else [s])
+                except (AttributeError, TypeError):
+                    # No seeding capability
+                    seeds.append([s if s is not None else 0])
+        
+        return seeds
 
-        self.get_logger().info(f"State: {self.current_state}, Collision: {global_vars.clash_sum}, " 
-                              f"Reward: {reward}, Angular velocity: {self.angular_velocity}")
 
-        return self.current_state, reward, self.done
-
-    def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps):
-        """
-        Calculate reward based on current state.
-        """
-        # Check for collision
-        if clash_sum > 0:
-            self.get_logger().info("COLLISION DETECTED. EPISODE ENDED.")
-            self.done = True
-            return -10
-            
-        # Check for timeout
-        if time_steps >= max_episode_steps:
-            self.get_logger().info("TIME LIMIT REACHED. EPISODE ENDED.")
-            self.done = True
-            return 0
-            
-        # Check for goal reached - use boolean operations for efficiency
-        at_goal = (20.0 < global_vars.body_pose[0] < 28.0 and 
-                   -28.0 < global_vars.body_pose[1] < -20.0)
-        if at_goal:
-            self.get_logger().info("GOAL REACHED. EPISODE ENDED.")
-            self.done = True
-            return 20
-            
-        # Penalty for getting too close to obstacles
-        if np.min(global_vars.lidar_data) < 3:
-            self.get_logger().info("TOO CLOSE TO OBSTACLE.")
-            return -5
-            
-        # Reward for making progress toward the goal
-        if distance_to_goal < self.prev_distance:
-            return 10 * max(1 - distance_to_goal / 67.22, 0)
+def make_vec_env(env_id=None, env_fn=None, num_envs=4, seed=None, track_id=0, render_mode=None):
+    """
+    Create a vectorized environment.
+    
+    Args:
+        env_id: Gym environment ID
+        env_fn: Function to create environment
+        num_envs: Number of environments
+        seed: Random seed
+        track_id: Track ID for NavigationGoal environment
+        render_mode: Rendering mode
+        
+    Returns:
+        VecEnv: Vectorized environment
+    """
+    if env_fn is None:
+        if env_id == 'gym_navigation:NavigationGoal-v0':
+            # Create gym-navigation environment by Nick Geramanis
+            def _make_env():
+                env = gym.make('gym_navigation:NavigationGoal-v0', 
+                               render_mode=render_mode if render_mode else None,
+                               track_id=track_id)
+                return env
+            env_fn = _make_env
         else:
-            return -1  # Penalty for moving away from the goal
-
-    def reset(self, euler_angle=None):
-        """
-        Reset the environment to initial state with random obstacle placement.
-        Memory-optimized implementation.
-        """
-        simulation_context_ref = self.simulation_context()
-        if simulation_context_ref is None:
-            self.get_logger().error("Simulation context reference is no longer valid")
-            return self.current_state
-            
-        # Reset simulation
-        simulation_context_ref.reset()
-        
-        # Clear images efficiently
-        if global_vars.image_for_clash_calc is not None:
-            global_vars.image_for_clash_calc.fill(0)
-            # Flush changes to disk if using memmapped array
-            if hasattr(global_vars.image_for_clash_calc, 'flush'):
-                global_vars.image_for_clash_calc.flush()
-                
-        if global_vars.image is not None:
-            global_vars.image.fill(0)
-            # Flush changes to disk if using memmapped array
-            if hasattr(global_vars.image, 'flush'):
-                global_vars.image.flush()
-            
-        self.prev_distance = 0
-        global_vars.clash_sum = 0  # Reset collision counter
-
-        # Draw start and goal regions
-        self._draw_start_goal_regions()
-        
-        # Generate random positions for obstacles
-        obstacle_positions = self._generate_random_obstacle_positions()
-        
-        # Place obstacles in the environment
-        self._place_obstacles(obstacle_positions)
-        
-        # Add boundary walls
-        self._add_boundary_walls()
-        
-        self.done = False
-        self.current_state.fill(0.0)
-
-        return self.current_state
-        
-    def _draw_start_goal_regions(self):
-        """Draw start and goal regions on the image - optimized implementation"""
-        # Pre-calculate coordinates for efficiency
-        # Goal region (green)
-        pt_start1 = (int((self.stage_width/2 - self.obstacle_size/2 + 24)/self.pixel_to_meter), 
-                    int((self.stage_height/2 + self.obstacle_size/2 + 24)/self.pixel_to_meter))
-        pt_start2 = (int((self.stage_width/2 + self.obstacle_size/2 + 24)/self.pixel_to_meter), 
-                    int((self.stage_height/2 - self.obstacle_size/2 + 24)/self.pixel_to_meter))
-        
-        # Start region (red)
-        pt_goal1 = (int((self.stage_width/2 - self.obstacle_size/2 - 24)/self.pixel_to_meter), 
-                int((self.stage_height/2 + self.obstacle_size/2 - 24)/self.pixel_to_meter))
-        pt_goal2 = (int((self.stage_width/2 + self.obstacle_size/2 - 24)/self.pixel_to_meter), 
-                int((self.stage_height/2 - self.obstacle_size/2 - 24)/self.pixel_to_meter))
-        
-        # Draw rectangles
-        cv2.rectangle(global_vars.image, pt_start1, pt_start2, (0, 255, 0), cv2.FILLED, cv2.LINE_8)
-        cv2.rectangle(global_vars.image, pt_goal1, pt_goal2, (0, 0, 255), cv2.FILLED, cv2.LINE_8)
-        
-        # Flush changes if using memmapped array
-        if hasattr(global_vars.image, 'flush'):
-            global_vars.image.flush()
+            # Standard gym environment
+            def _make_env():
+                try:
+                    env = gym.make(env_id, render_mode=render_mode)
+                except TypeError:
+                    # Fallback for environments that don't support render_mode
+                    env = gym.make(env_id)
+                return env
+            env_fn = _make_env
     
-    def _generate_random_obstacle_positions(self):
-        """Generate random positions for obstacles - FIXED implementation"""
-        # FIX: Generate individual positions for each pair to ensure enough unique positions
-        rng = np.random.default_rng()
-        positions = []
-        
-        # For each of the 7 regions, generate 2 unique positions from 0-8
-        for _ in range(7):
-            # Generate 2 unique numbers in range 0-8
-            region_positions = rng.choice(9, size=2, replace=False)
-            positions.append(region_positions)
-            
-        return positions
+    # Create multiple environments
+    env_fns = [env_fn for _ in range(num_envs)]
     
-    def _place_obstacles(self, obstacle_positions):
-        """Place obstacles in the environment based on random positions - optimized implementation"""
-        # Predefined obstacle regions and their coordinates - use NumPy array for efficiency
-        regions = np.array([
-            # Region 1: Top-left
-            [
-                [[-8, 32, -2.3], [0.0, 32, -2.3], [8, 32, -2.3]],
-                [[-8, 24, -2.3], [0.0, 24, -2.3], [8, 24, -2.3]],
-                [[-8, 16, -2.3], [0.0, 16, -2.3], [8, 16, -2.3]]
-            ],
-            # Region 2: Top-right
-            [
-                [[16, 32, -2.3], [24, 32, -2.3], [32, 32, -2.3]],
-                [[16, 24, -2.3], [24, 24, -2.3], [32, 24, -2.3]],
-                [[16, 16, -2.3], [24, 16, -2.3], [32, 16, -2.3]]
-            ],
-            # Regions 3-7 (omitted for brevity)
-            # ...
-        ], dtype=np.float32)
-        
-        # More regions (copied from original)
-        regions = [
-            # Region 1: Top-left
-            [
-                [[-8, 32, -2.3], [0.0, 32, -2.3], [8, 32, -2.3]],
-                [[-8, 24, -2.3], [0.0, 24, -2.3], [8, 24, -2.3]],
-                [[-8, 16, -2.3], [0.0, 16, -2.3], [8, 16, -2.3]]
-            ],
-            # Region 2: Top-right
-            [
-                [[16, 32, -2.3], [24, 32, -2.3], [32, 32, -2.3]],
-                [[16, 24, -2.3], [24, 24, -2.3], [32, 24, -2.3]],
-                [[16, 16, -2.3], [24, 16, -2.3], [32, 16, -2.3]]
-            ],
-            # Region 3: Middle-left
-            [
-                [[-32, 8, -2.3], [-24, 8, -2.3], [-16, 8, -2.3]],
-                [[-32, 0.0, -2.3], [-24, 0.0, -2.3], [-16, 0.0, -2.3]],
-                [[-32, -8, -2.3], [-24, -8, -2.3], [-16, -8, -2.3]]
-            ],
-            # Region 4: Middle-center
-            [
-                [[-8, 8, -2.3], [0.0, 8, -2.3], [8, 8, -2.3]],
-                [[-8, 0.0, -2.3], [0.0, 0.0, -2.3], [8, 0.0, -2.3]],
-                [[-8, -8, -2.3], [0.0, -8, -2.3], [8, -8, -2.3]]
-            ],
-            # Region 5: Middle-right
-            [
-                [[16, 8, -2.3], [24, 8, -2.3], [32, 8, -2.3]],
-                [[16, 0.0, -2.3], [24, 0.0, -2.3], [32, 0.0, -2.3]],
-                [[16, -8, -2.3], [24, -8, -2.3], [32, -8, -2.3]]
-            ],
-            # Region 6: Bottom-left
-            [
-                [[-32, -16, -2.3], [-24, -16, -2.3], [-16, -16, -2.3]],
-                [[-32, -24, -2.3], [-24, -24, -2.3], [-16, -24, -2.3]],
-                [[-32, -32, -2.3], [-24, -32, -2.3], [-16, -32, -2.3]]
-            ],
-            # Region 7: Bottom-center
-            [
-                [[-8, -16, -2.3], [0.0, -16, -2.3], [8, -16, -2.3]],
-                [[-8, -24, -2.3], [0.0, -24, -2.3], [8, -24, -2.3]],
-                [[-8, -32, -2.3], [0.0, -32, -2.3], [8, -32, -2.3]]
-            ]
-        ]
-        
-        # Pre-calculate obstacle drawing coordinates
-        pt_cache = {}
-        
-        # For each region, place two obstacles at random positions
-        cube_index = 0
-        for region_idx, pos_pair in enumerate(obstacle_positions):
-            for pos_idx in range(2):  # Two obstacles per region
-                # Calculate position from region and random choice
-                pos_value = pos_pair[pos_idx]
-                row = pos_value // 3
-                col = pos_value % 3
-                coords = regions[region_idx][row][col]
-                
-                # Set obstacle position
-                self.cube_transforms[cube_index].set_world_pose(coords, [0.0, 0.0, 0.0, 1.0])
-                
-                # Calculate drawing coordinates (cached for efficiency)
-                key = (coords[0], coords[1])
-                if key not in pt_cache:
-                    pt1 = (int((self.stage_width/2 - self.obstacle_size/2 + coords[0])/self.pixel_to_meter), 
-                          int((self.stage_height/2 + self.obstacle_size/2 - coords[1])/self.pixel_to_meter))
-                    pt2 = (int((self.stage_width/2 + self.obstacle_size/2 + coords[0])/self.pixel_to_meter), 
-                          int((self.stage_height/2 - self.obstacle_size/2 - coords[1])/self.pixel_to_meter))
-                    pt_cache[key] = (pt1, pt2)
-                else:
-                    pt1, pt2 = pt_cache[key]
-                
-                # Draw obstacle on images
-                cv2.rectangle(global_vars.image, pt1, pt2, (200, 200, 200), cv2.FILLED, cv2.LINE_8)
-                cv2.rectangle(global_vars.image_for_clash_calc, pt1, pt2, 255, cv2.FILLED, cv2.LINE_8)
-                
-                cube_index += 1
-                
-        # Flush memory-mapped changes if applicable
-        if hasattr(global_vars.image, 'flush'):
-            global_vars.image.flush()
-        if hasattr(global_vars.image_for_clash_calc, 'flush'):
-            global_vars.image_for_clash_calc.flush()
-
-    def _add_boundary_walls(self):
-        """Add boundary walls to the environment - memory-optimized implementation"""
-        # Add walls with slice operations for efficiency
-        global_vars.image_for_clash_calc[0:4, :] = 255
-        global_vars.image_for_clash_calc[716:720, :] = 255
-        global_vars.image_for_clash_calc[:, 0:4] = 255
-        global_vars.image_for_clash_calc[:, 716:720] = 255
-        
-        # Flush memory-mapped changes if applicable
-        if hasattr(global_vars.image_for_clash_calc, 'flush'):
-            global_vars.image_for_clash_calc.flush()
-            
-    def __del__(self):
-        """Clean up resources when object is deleted"""
-        try:
-            # Clean up memory-mapped files
-            if hasattr(self, 'image_file') and os.path.exists(self.image_file):
-                os.remove(self.image_file)
-            if hasattr(self, 'clash_image_file') and os.path.exists(self.clash_image_file):
-                os.remove(self.clash_image_file)
-        except Exception as e:
-            print(f"Error cleaning up environment resources: {e}")
+    # Check available CPU count for optimal performance
+    cpu_count = mp.cpu_count()
+    if num_envs <= 1 or cpu_count <= 1:
+        # Use sequential environment if only one env or one CPU
+        vec_env = DummyVecEnv(env_fns)
+    else:
+        # Use parallel environment otherwise
+        vec_env = SubprocVecEnv(env_fns)
+    
+    # Set seeds if provided
+    if seed is not None:
+        vec_env.seed(seed)
+    
+    return vec_env

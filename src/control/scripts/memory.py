@@ -2,14 +2,13 @@ import random
 import numpy as np
 import os
 import pickle
-from collections import deque
 
 class ReplayMemory:
     """
     Memory-optimized replay buffer for off-policy reinforcement learning algorithms like SAC.
     Uses NumPy arrays for efficient storage and access of transitions.
     """
-    def __init__(self, capacity, state_dim=22, action_dim=1, seed=0):
+    def __init__(self, capacity, state_dim, action_dim, seed=0):
         """
         Initialize optimized replay buffer with pre-allocated NumPy arrays.
         
@@ -54,6 +53,33 @@ class ReplayMemory:
         # Update position and size
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+    
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """
+        Add a batch of transitions to the buffer (vectorized version).
+        
+        Args:
+            states: Batch of current states
+            actions: Batch of actions taken
+            rewards: Batch of rewards received
+            next_states: Batch of next states
+            dones: Batch of episode termination flags
+        """
+        batch_size = len(states)
+        
+        # Calculate indices for the batch, handling buffer wrapping
+        indices = np.arange(self.position, self.position + batch_size) % self.capacity
+        
+        # Store transitions
+        self.states[indices] = states
+        self.actions[indices] = actions
+        self.rewards[indices] = rewards
+        self.next_states[indices] = next_states
+        self.dones[indices] = dones
+        
+        # Update position and size
+        self.position = (self.position + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
         
     def sample(self, batch_size):
         """
