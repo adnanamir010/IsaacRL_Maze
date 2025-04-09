@@ -16,6 +16,7 @@ This project implements the Soft Actor-Critic (SAC) reinforcement learning algor
 1. Clone this repository:
    ```bash
    git clone https://github.com/adnanamir010/IsaacRL_Maze.git
+   git checkout alternate_timeline
    cd IsaacRL_Maze/src/control/scripts
    ```
 
