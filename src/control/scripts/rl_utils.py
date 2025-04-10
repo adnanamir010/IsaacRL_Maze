@@ -301,7 +301,7 @@ def save_learning_curve(episodes, rewards, eval_episodes=None, eval_rewards=None
     # Add labels and title with optimized settings
     plt.xlabel('Episodes')
     plt.ylabel('Reward')
-    plt.title('SAC Learning Curve')
+    plt.title('PPO - Learning Curve')
     plt.legend()
     plt.grid(True, alpha=0.3)
     
