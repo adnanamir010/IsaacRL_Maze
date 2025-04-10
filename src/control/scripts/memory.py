@@ -252,11 +252,18 @@ class RolloutStorage:
         self.advantages.fill(0)
         last_advantage = 0
         
-        # Ensure next_value is flattened to match expected shape
-        if hasattr(next_value, 'shape') and len(next_value.shape) > 1:
-            next_val = next_value.flatten()
+        # Ensure next_value is properly formatted
+        if isinstance(next_value, np.ndarray):
+            if next_value.size == 1:
+                next_val = float(next_value)  # Convert single-element array to scalar
+            else:
+                next_val = next_value.flatten()[0]  # Take the first element if multiple
+        elif isinstance(next_value, list):
+            next_val = next_value[0]  # Take first element if it's a list
+        elif hasattr(next_value, 'item'):  # Torch tensor
+            next_val = next_value.item()  # Convert tensor to scalar
         else:
-            next_val = next_value
+            next_val = next_value  # Already a scalar
         
         # Compute returns and advantages in reverse order (more efficient in NumPy)
         for step in reversed(range(num_steps)):
@@ -270,17 +277,24 @@ class RolloutStorage:
             delta = self.rewards[step] + gamma * next_val_step * self.masks[step] - self.values[step]
             
             # Update advantage using GAE
+            if isinstance(last_advantage, (np.ndarray, list)) and len(last_advantage) == 1:
+                last_advantage = float(last_advantage[0])  # Convert to scalar if it's a single-element array
+            
             last_advantage = delta + gamma * gae_lambda * self.masks[step] * last_advantage
             
-            # Make sure last_advantage is a scalar if it's a single-element array
-            if hasattr(last_advantage, 'shape') and last_advantage.size == 1:
-                last_advantage = float(last_advantage)
+            # Handle the case where last_advantage is still an array
+            if isinstance(last_advantage, (np.ndarray, list)):
+                if len(last_advantage) == 1:
+                    self.advantages[step] = float(last_advantage[0])
+                else:
+                    # Just take the first element as a fallback
+                    self.advantages[step] = float(last_advantage[0])
+            else:
+                # It's already a scalar
+                self.advantages[step] = last_advantage
                 
-            self.advantages[step] = last_advantage
-            
         # Calculate returns (advantage + value)
         self.returns[:num_steps] = self.advantages[:num_steps] + self.values[:num_steps]
-
     def get_data(self):
         """
         Get all stored data as a dictionary.
