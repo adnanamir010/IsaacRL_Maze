@@ -252,8 +252,11 @@ class RolloutStorage:
         self.advantages.fill(0)
         last_advantage = 0
         
-        # Initialize the next value
-        next_val = next_value
+        # Ensure next_value is flattened to match expected shape
+        if hasattr(next_value, 'shape') and len(next_value.shape) > 1:
+            next_val = next_value.flatten()
+        else:
+            next_val = next_value
         
         # Compute returns and advantages in reverse order (more efficient in NumPy)
         for step in reversed(range(num_steps)):
@@ -268,11 +271,16 @@ class RolloutStorage:
             
             # Update advantage using GAE
             last_advantage = delta + gamma * gae_lambda * self.masks[step] * last_advantage
+            
+            # Make sure last_advantage is a scalar if it's a single-element array
+            if hasattr(last_advantage, 'shape') and last_advantage.size == 1:
+                last_advantage = float(last_advantage)
+                
             self.advantages[step] = last_advantage
             
         # Calculate returns (advantage + value)
         self.returns[:num_steps] = self.advantages[:num_steps] + self.values[:num_steps]
-            
+
     def get_data(self):
         """
         Get all stored data as a dictionary.

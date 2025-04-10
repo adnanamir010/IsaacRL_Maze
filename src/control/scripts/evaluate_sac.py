@@ -7,23 +7,23 @@ import gymnasium as gym
 import time
 from agents import SAC
 from rl_utils import evaluate_policy
-from environment import make_vec_env
+from environment import VectorizedDDEnv, make_vectorized_env
 
 def parse_arguments():
     """Parse command line arguments for the evaluation script"""
     parser = argparse.ArgumentParser(description='Evaluate a trained SAC agent')
-    parser.add_argument('--env-name', default="gym_navigation:NavigationGoal-v0",
-                    help='Environment name (default: gym_navigation:NavigationGoal-v0)')
-    parser.add_argument('--track-id', type=int, default=0,
-                    help='Track ID for NavigationGoal environment (default: 0)')
+    parser.add_argument('--env-name', default="VectorizedDD",
+                    help='Environment name (default: VectorizedDD)')
     parser.add_argument('--checkpoint', type=str, required=True,
                     help='Path to the checkpoint file')
     parser.add_argument('--seed', type=int, default=123456, metavar='N',
                     help='Random seed (default: 123456)')
     parser.add_argument('--num-episodes', type=int, default=10,
                     help='Number of evaluation episodes (default: 10)')
-    parser.add_argument('--render', action='store_true', default=False,
-                    help='Render the environment (default: False)')
+    parser.add_argument('--render', action='store_true', default=True,
+                    help='Render the environment (default: True)')
+    parser.add_argument('--delay', type=float, default=0.01,
+                    help='Delay between rendered frames (default: 0.01s)')
     parser.add_argument('--hidden-size', type=int, default=256,
                     help='Hidden layer size (default: 256)')
     parser.add_argument('--cuda', action="store_true", default=True,
@@ -48,36 +48,39 @@ def main():
     print(f"Using device: {device}")
     
     # Create environment
-    render_mode = 'human' if args.render else None
-    
-    if args.env_name == "gym_navigation:NavigationGoal-v0":
-        env = gym.make(args.env_name, render_mode=render_mode, track_id=args.track_id)
+    render_mode = 'human' if args.render else None    
+
+    if args.env_name == "VectorizedDD":
+        env = VectorizedDDEnv(render_mode=render_mode)
     else:
         try:
             env = gym.make(args.env_name, render_mode=render_mode)
         except TypeError:
             # Fallback for environments that don't support render_mode
-            env = gym.make(args.env_name)
-    
+            env = gym.make(args.env_name)    
     # Set environment seed
-    env.seed(args.seed)
+    try:
+        env.reset(seed=args.seed)
+    except (TypeError, AttributeError):
+        try:
+            env.seed(args.seed)
+        except (AttributeError, TypeError):
+            pass  # Ignore if seeding is not supported
     
     # Get state and action dimensions
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
     
-    # Create action space for SAC
-    class ActionSpace:
-        def __init__(self, low, high, shape):
-            self.low = low
-            self.high = high
-            self.shape = shape
-    
-    action_space = ActionSpace(
-        env.action_space.low,
-        env.action_space.high,
-        env.action_space.shape
-    )
+    # Handle different types of action spaces
+    if isinstance(env.action_space, gym.spaces.Box):
+        action_dim = env.action_space.shape[0]
+        print(f"Continuous action space detected with {action_dim} dimensions")
+    elif isinstance(env.action_space, gym.spaces.Discrete):
+        action_dim = 1  # Discrete action is represented as a single integer
+        print(f"Discrete action space detected with {env.action_space.n} possible actions")
+    else:
+        raise ValueError(f"Unsupported action space type: {type(env.action_space)}")
+        
+    print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
     
     # Initialize SAC agent
     class Args:
@@ -93,7 +96,7 @@ def main():
             self.cuda = use_cuda
     
     agent_args = Args()
-    agent = SAC(state_dim, action_space, agent_args)
+    agent = SAC(state_dim, env.action_space, agent_args)
     
     # Load checkpoint
     agent.load_checkpoint(args.checkpoint, evaluate=True)
@@ -119,9 +122,18 @@ def main():
             # Fallback for environments with different reset signatures
             state = env.reset()
         
+        print(f"Episode {episode+1}: Starting evaluation...")
+        
         while not done:
             # Select action
             action = agent.select_action(state, evaluate=True)
+            
+            # For discrete actions, ensure correct format
+            if isinstance(env.action_space, gym.spaces.Discrete):
+                if isinstance(action, np.ndarray) and action.size == 1:
+                    action = action[0]
+                if hasattr(action, 'item'):
+                    action = action.item()
             
             # Take step in environment
             result = env.step(action)
@@ -138,7 +150,10 @@ def main():
             episode_reward += reward
             episode_steps += 1
             
-            # Render if requested (already handled by render_mode)
+            # Render if requested (and not already handled by render_mode)
+            if args.render and render_mode != "human":
+                env.render()
+                time.sleep(args.delay)  # Add delay to make rendering viewable
         
         # Update totals
         total_reward += episode_reward

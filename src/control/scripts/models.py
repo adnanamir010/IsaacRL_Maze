@@ -20,6 +20,47 @@ def weights_init_(m):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         torch.nn.init.constant_(m.bias, 0)
 
+
+class ValueNetwork(nn.Module):
+    """
+    Value network that estimates state values for PPO.
+    """
+    def __init__(self, num_inputs, hidden_dim, init_w=3e-3):
+        """
+        Initialize Value Network.
+        
+        Args:
+            num_inputs (int): Dimension of state space
+            hidden_dim (int): Size of hidden layers
+            init_w (float): Weight initialization range
+        """
+        super(ValueNetwork, self).__init__()
+        
+        # MLP for value function
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+        
+        # Weight initialization
+        self.apply(weights_init_)
+        
+    def forward(self, state):
+        """
+        Forward pass to get state value.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            
+        Returns:
+            torch.Tensor: State value estimate
+        """
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        x = self.linear3(x)
+        
+        return x
+
+
 class QNetwork(nn.Module):
     """
     Critic network for SAC that estimates Q-values (state-action values).
@@ -229,6 +270,43 @@ class GaussianPolicy(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         
         return action, log_prob, mean
+        
+    def evaluate(self, state, action):
+        """
+        Evaluate an action given a state, useful for PPO to get new log probs for old actions.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            action (torch.Tensor): Action tensor
+            
+        Returns:
+            tuple: (action, log_prob, entropy) - resampled action, log probability, and entropy
+        """
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        
+        # Create normal distribution
+        normal = torch.distributions.Normal(mean, std)
+        
+        # Get log probabilities
+        # For actions in tanh-transformed space, we need to apply correction
+        action_normalized = (action - self.action_bias) / self.action_scale
+        
+        # Inverse tanh to get original gaussian samples x_t
+        action_normalized = torch.clamp(action_normalized, -0.999, 0.999)  # Avoid numerical instability
+        x_t = 0.5 * torch.log((1 + action_normalized) / (1 - action_normalized))
+        
+        # Get log probability
+        log_prob = normal.log_prob(x_t)
+        
+        # Apply tanh correction: log(1 - tanh^2(x)) = log(1 - y^2)
+        log_prob -= torch.log(self.action_scale * (1 - action_normalized.pow(2)) + EPSILON)
+        log_prob = log_prob.sum(1, keepdim=True)
+        
+        # Compute entropy
+        entropy = normal.entropy().sum(1, keepdim=True)
+        
+        return action, log_prob, entropy
 
     def to(self, device):
         """
@@ -401,6 +479,34 @@ class DiscretePolicy(nn.Module):
         log_prob = torch.gather(log_prob, -1, action)
         
         return action, log_prob, action_probs
+        
+    def evaluate(self, state, action):
+        """
+        Evaluate an action given a state, useful for PPO to get new log probs for old actions.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            action (torch.Tensor): Action tensor (indices)
+            
+        Returns:
+            tuple: (action, log_prob, entropy) - same action, log probability, and entropy
+        """
+        action_logits = self.forward(state)
+        action_probs = F.softmax(action_logits, dim=-1)
+        log_probs = F.log_softmax(action_logits, dim=-1)
+        
+        # Calculate entropy
+        entropy = -torch.sum(action_probs * log_probs, dim=-1, keepdim=True)
+        
+        # Get log probabilities for the given actions
+        if action.dim() == 2 and action.size(1) == 1:
+            # If actions are indices
+            selected_log_probs = torch.gather(log_probs, 1, action.long())
+        else:
+            # If actions are one-hot encoded
+            selected_log_probs = (action * log_probs).sum(dim=-1, keepdim=True)
+        
+        return action, selected_log_probs, entropy
     
     def to(self, device):
         """

@@ -5,7 +5,7 @@ from torch.optim import Adam
 import numpy as np
 import gymnasium as gym
 from rl_utils import soft_update, hard_update
-from models import QNetwork, GaussianPolicy, DeterministicPolicy, DiscretePolicy
+from models import GaussianPolicy, DeterministicPolicy, DiscretePolicy, ValueNetwork, QNetwork
 
 class SAC(object):
     """
@@ -349,3 +349,750 @@ class SAC(object):
                 self.policy.train()
                 self.critic.train()
                 self.critic_target.train()
+
+class PPOCLIP(object):
+    """
+    Proximal Policy Optimization (PPO) with clipped objective.
+    PPO is an on-policy actor-critic algorithm that uses a clipped surrogate objective
+    to limit policy updates, preventing too large policy changes.
+    """
+    def __init__(self, num_inputs, action_space, args):
+        """
+        Initialize PPO with clipped objective.
+        
+        Args:
+            num_inputs (int): Dimension of state space
+            action_space: Action space with shape and bounds
+            args: Configuration arguments
+        """
+        # Algorithm parameters
+        self.gamma = args.gamma                   # Discount factor
+        self.tau = args.tau                       # Soft update coefficient (if needed)
+        self.clip_param = args.clip_param         # Clipping parameter
+        self.ppo_epoch = args.ppo_epoch           # Number of optimization epochs
+        self.num_mini_batch = args.num_mini_batch # Number of minibatches for optimization
+        self.value_loss_coef = args.value_loss_coef  # Value loss coefficient
+        self.entropy_coef = args.entropy_coef     # Entropy coefficient
+        self.max_grad_norm = args.max_grad_norm   # Maximum gradient norm
+        self.use_clipped_value_loss = args.use_clipped_value_loss  # Whether to use clipped value loss
+
+        # Device setup
+        self.device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+        
+        # Determine action dimensions and type
+        if isinstance(action_space, gym.spaces.Box):
+            self.action_dim = action_space.shape[0]
+            self.discrete = False
+        elif isinstance(action_space, gym.spaces.Discrete):
+            self.action_dim = action_space.n  # Number of discrete actions
+            self.discrete = True
+        else:
+            raise ValueError(f"Unsupported action space type: {type(action_space)}")
+
+        # Value network (critic)
+        self.value_net = ValueNetwork(num_inputs, args.hidden_size).to(device=self.device)
+        self.value_optimizer = Adam(self.value_net.parameters(), lr=args.value_lr)
+
+        # Policy network (actor)
+        if self.discrete:
+            self.policy = DiscretePolicy(num_inputs, self.action_dim, args.hidden_size).to(self.device)
+        else:
+            self.policy = GaussianPolicy(num_inputs, self.action_dim, args.hidden_size, action_space).to(self.device)
+            
+        self.policy_optimizer = Adam(self.policy.parameters(), lr=args.policy_lr)
+
+    def select_action(self, state, evaluate=False):
+        """
+        Select an action based on the current policy.
+        
+        Args:
+            state: Current state
+            evaluate (bool): Whether to evaluate (use mean) or explore (sample)
+            
+        Returns:
+            numpy.ndarray: Selected action
+            float: Log probability of the action
+            float: Value estimate
+        """
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        
+        # Get value estimate
+        value = self.value_net(state)
+        
+        if self.discrete:
+            # Discrete actions
+            with torch.no_grad():
+                if evaluate:
+                    # Use most probable action for evaluation
+                    _, _, action_probs = self.policy.sample(state)
+                    action = torch.argmax(action_probs, dim=-1, keepdim=True)
+                    log_prob = torch.log(action_probs.gather(-1, action))
+                else:
+                    # Sample action for training
+                    action, log_prob, _ = self.policy.sample(state)
+            
+            return action.detach().cpu().numpy()[0], log_prob.detach().cpu().numpy()[0], value.detach().cpu().numpy()[0]
+        else:
+            # Continuous actions
+            with torch.no_grad():
+                if evaluate:
+                    # Use mean action for evaluation
+                    _, _, action = self.policy.sample(state)
+                    # For evaluation, we still need the log probability
+                    _, log_prob, _ = self.policy.evaluate(state, action)
+                else:
+                    # Sample action for training
+                    action, log_prob, _ = self.policy.sample(state)
+                
+            return action.detach().cpu().numpy()[0], log_prob.detach().cpu().numpy()[0], value.detach().cpu().numpy()[0]
+
+    def select_actions_vec(self, states, evaluate=False):
+        """
+        Select actions for multiple states (vectorized version).
+        
+        Args:
+            states: Batch of states
+            evaluate (bool): Whether to evaluate (use mean) or explore (sample)
+            
+        Returns:
+            numpy.ndarray: Batch of selected actions
+            numpy.ndarray: Batch of log probabilities
+            numpy.ndarray: Batch of value estimates
+        """
+        # Handle empty states case (can happen during evaluation)
+        if states.size == 0 or len(states.shape) < 2:
+            return np.array([]), np.array([]), np.array([])
+        
+        # Convert to tensor
+        states = torch.FloatTensor(states).to(self.device)
+        
+        # Get value estimates
+        values = self.value_net(states)
+        
+        with torch.no_grad():
+            if self.discrete:
+                # Discrete actions
+                if evaluate:
+                    # Use most probable action for evaluation
+                    _, _, action_probs = self.policy.sample(states)
+                    actions = torch.argmax(action_probs, dim=-1, keepdim=True)
+                    log_probs = torch.log(action_probs.gather(-1, actions))
+                else:
+                    # Sample action for training
+                    actions, log_probs, _ = self.policy.sample(states)
+            else:
+                # Continuous actions
+                if evaluate:
+                    # Use mean action for evaluation
+                    _, _, actions = self.policy.sample(states)
+                    # For evaluation, we still need the log probabilities
+                    _, log_probs, _ = self.policy.evaluate(states, actions)
+                else:
+                    # Sample action for training
+                    actions, log_probs, _ = self.policy.sample(states)
+                
+        return actions.detach().cpu().numpy(), log_probs.detach().cpu().numpy(), values.detach().cpu().numpy()
+
+    def get_value(self, state):
+        """
+        Get value estimate for a state.
+        
+        Args:
+            state: Current state
+            
+        Returns:
+            float: Value estimate
+        """
+        state = torch.FloatTensor(state).to(self.device)
+        with torch.no_grad():
+            value = self.value_net(state)
+        return value.detach().cpu().numpy()
+
+    def update_parameters(self, rollouts):
+        """
+        Update policy and value parameters using PPO with clipped objective.
+        
+        Args:
+            rollouts: RolloutStorage containing batch of experiences
+            
+        Returns:
+            tuple: Loss values for logging
+        """
+        # Get rollout data
+        rollout_data = rollouts.get_data()
+        states = torch.FloatTensor(rollout_data['states']).to(self.device)
+        actions = torch.FloatTensor(rollout_data['actions']).to(self.device)
+        returns = torch.FloatTensor(rollout_data['returns']).to(self.device).view(-1, 1)
+        masks = torch.FloatTensor(rollout_data['masks']).to(self.device).view(-1, 1)
+        old_log_probs = torch.FloatTensor(rollout_data['log_probs']).to(self.device).view(-1, 1)
+        advantages = torch.FloatTensor(rollout_data['advantages']).to(self.device).view(-1, 1)
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Convert discrete actions to long tensors for indexing if needed
+        if self.discrete and actions.shape[-1] == 1:
+            actions = actions.long()
+        
+        # Training info for logging
+        value_loss_epoch = 0
+        policy_loss_epoch = 0
+        entropy_epoch = 0
+        clip_fraction_epoch = 0
+        
+        # Create batches for multiple epochs of training on the same data
+        batch_size = states.size(0)
+        mini_batch_size = batch_size // self.num_mini_batch
+        
+        for _ in range(self.ppo_epoch):
+            # Generate random indices for creating mini-batches
+            indices = torch.randperm(batch_size).to(self.device)
+            
+            for start_idx in range(0, batch_size, mini_batch_size):
+                # Extract mini-batch indices
+                end_idx = min(start_idx + mini_batch_size, batch_size)
+                mb_indices = indices[start_idx:end_idx]
+                
+                # Get mini-batch data
+                mb_states = states[mb_indices]
+                mb_actions = actions[mb_indices]
+                mb_returns = returns[mb_indices]
+                mb_masks = masks[mb_indices]
+                mb_old_log_probs = old_log_probs[mb_indices]
+                mb_advantages = advantages[mb_indices]
+                
+                # Evaluate actions and get current log probs and entropy
+                if self.discrete:
+                    # For discrete actions
+                    action_logits = self.policy(mb_states)
+                    action_probs = F.softmax(action_logits, dim=-1)
+                    log_probs = F.log_softmax(action_logits, dim=-1)
+                    
+                    if mb_actions.shape[-1] == 1:  # If actions are indices
+                        # Calculate entropy - ensure it's a scalar by taking mean
+                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
+                        mb_new_log_probs = torch.gather(log_probs, 1, mb_actions)
+                    else:  # If actions are one-hot encoded
+                        # Calculate entropy - ensure it's a scalar by taking mean
+                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
+                        mb_new_log_probs = (mb_actions * log_probs).sum(dim=-1, keepdim=True)
+                else:
+                    # For continuous actions
+                    _, mb_new_log_probs, dist_entropy = self.policy.evaluate(mb_states, mb_actions)
+                    # Ensure entropy is a scalar
+                    if dist_entropy.dim() > 0:
+                        dist_entropy = dist_entropy.mean()
+                
+                # Get current value prediction
+                values = self.value_net(mb_states)
+                
+                # Calculate ratios and surrogate objectives
+                ratios = torch.exp(mb_new_log_probs - mb_old_log_probs)
+                
+                # Clipped surrogate objective
+                surr1 = ratios * mb_advantages
+                surr2 = torch.clamp(ratios, 1.0 - self.clip_param, 1.0 + self.clip_param) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # Record clipping statistics
+                clipped = (ratios < 1.0 - self.clip_param) | (ratios > 1.0 + self.clip_param)
+                clip_fraction = clipped.float().mean().item()
+                clip_fraction_epoch += clip_fraction
+                
+                # Value loss
+                if self.use_clipped_value_loss:
+                    # Get old value predictions (assuming they are stored in rollouts)
+                    old_values = rollout_data['values']
+                    old_values = torch.FloatTensor(old_values).to(self.device).view(-1, 1)[mb_indices]
+                    
+                    # Clipped value loss
+                    values_clipped = old_values + torch.clamp(values - old_values, -self.clip_param, self.clip_param)
+                    value_loss_unclipped = (values - mb_returns).pow(2)
+                    value_loss_clipped = (values_clipped - mb_returns).pow(2)
+                    value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+                else:
+                    # Simple MSE value loss
+                    value_loss = 0.5 * F.mse_loss(values, mb_returns)
+                
+                # Combined loss with value and entropy terms
+                # Make sure each component is a scalar
+                loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * dist_entropy
+                
+                # Make sure loss is a scalar before calling backward()
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                
+                # Update policy
+                self.policy_optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                if self.max_grad_norm > 0:
+                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                
+                self.policy_optimizer.step()
+                self.value_optimizer.step()
+                
+                # Accumulate epoch statistics - ensure we're getting scalar values
+                value_loss_epoch += value_loss.item()
+                policy_loss_epoch += policy_loss.item()
+                # Convert entropy to scalar before adding to epoch total
+                entropy_epoch += dist_entropy.item()
+        
+        # Calculate average statistics
+        num_updates = self.ppo_epoch * self.num_mini_batch
+        value_loss_epoch /= num_updates
+        policy_loss_epoch /= num_updates
+        entropy_epoch /= num_updates
+        clip_fraction_epoch /= num_updates
+        
+        return value_loss_epoch, policy_loss_epoch, entropy_epoch, clip_fraction_epoch
+    
+    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
+        """
+        Save agent parameters to a checkpoint file.
+        
+        Args:
+            env_name (str): Environment name for checkpoint filename
+            suffix (str): Additional suffix for checkpoint filename
+            ckpt_path (str): Path to save checkpoint, if None uses default
+        """
+        if not os.path.exists('checkpoints/'):
+            os.makedirs('checkpoints/')
+            
+        if ckpt_path is None:
+            ckpt_path = f"checkpoints/ppo_clip_checkpoint_{env_name}_{suffix}"
+            
+        print(f'Saving models to {ckpt_path}')
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'value_net_state_dict': self.value_net.state_dict(),
+            'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
+            'value_optimizer_state_dict': self.value_optimizer.state_dict()
+        }, ckpt_path)
+
+    def load_checkpoint(self, ckpt_path, evaluate=False):
+        """
+        Load agent parameters from a checkpoint file.
+        
+        Args:
+            ckpt_path (str): Path to checkpoint file
+            evaluate (bool): Whether to set networks to evaluation mode
+        """
+        print(f'Loading models from {ckpt_path}')
+        if ckpt_path is not None:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.policy.load_state_dict(checkpoint['policy_state_dict'])
+            self.value_net.load_state_dict(checkpoint['value_net_state_dict'])
+            self.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state_dict'])
+            self.value_optimizer.load_state_dict(checkpoint['value_optimizer_state_dict'])
+
+            if evaluate:
+                self.policy.eval()
+                self.value_net.eval()
+            else:
+                self.policy.train()
+                self.value_net.train()
+
+class PPOKL(object):
+    """
+    Proximal Policy Optimization (PPO) with KL-divergence constraint.
+    PPO-KL uses an adaptive KL-divergence penalty to prevent too large policy changes.
+    """
+    def __init__(self, num_inputs, action_space, args):
+        """
+        Initialize PPO with KL-divergence constraint.
+        
+        Args:
+            num_inputs (int): Dimension of state space
+            action_space: Action space with shape and bounds
+            args: Configuration arguments
+        """
+        # Algorithm parameters
+        self.gamma = args.gamma                   # Discount factor
+        self.tau = args.tau                       # Soft update coefficient (if needed)
+        self.ppo_epoch = args.ppo_epoch           # Number of optimization epochs
+        self.num_mini_batch = args.num_mini_batch # Number of minibatches for optimization
+        self.value_loss_coef = args.value_loss_coef  # Value loss coefficient
+        self.entropy_coef = args.entropy_coef     # Entropy coefficient
+        self.max_grad_norm = args.max_grad_norm   # Maximum gradient norm
+        
+        # KL-specific parameters
+        self.kl_target = args.kl_target           # Target KL-divergence
+        self.kl_coef = args.kl_coef               # Initial KL coefficient
+        self.kl_adaptive = args.kl_adaptive       # Whether to adapt KL coefficient
+        self.kl_cutoff_factor = args.kl_cutoff_factor  # KL cutoff factor
+        self.kl_cutoff_coef = args.kl_cutoff_coef      # KL cutoff coefficient
+
+        # Device setup
+        self.device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
+        
+        # Determine action dimensions and type
+        if isinstance(action_space, gym.spaces.Box):
+            self.action_dim = action_space.shape[0]
+            self.discrete = False
+        elif isinstance(action_space, gym.spaces.Discrete):
+            self.action_dim = action_space.n  # Number of discrete actions
+            self.discrete = True
+        else:
+            raise ValueError(f"Unsupported action space type: {type(action_space)}")
+
+        # Value network (critic)
+        self.value_net = ValueNetwork(num_inputs, args.hidden_size).to(device=self.device)
+        self.value_optimizer = Adam(self.value_net.parameters(), lr=args.value_lr)
+
+        # Policy network (actor)
+        if self.discrete:
+            self.policy = DiscretePolicy(num_inputs, self.action_dim, args.hidden_size).to(self.device)
+        else:
+            self.policy = GaussianPolicy(num_inputs, self.action_dim, args.hidden_size, action_space).to(self.device)
+            
+        self.policy_optimizer = Adam(self.policy.parameters(), lr=args.policy_lr)
+
+    def select_action(self, state, evaluate=False):
+        """
+        Select an action based on the current policy.
+        
+        Args:
+            state: Current state
+            evaluate (bool): Whether to evaluate (use mean) or explore (sample)
+            
+        Returns:
+            numpy.ndarray: Selected action
+            float: Log probability of the action
+            float: Value estimate
+        """
+        state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+        
+        # Get value estimate
+        value = self.value_net(state)
+        
+        if self.discrete:
+            # Discrete actions
+            with torch.no_grad():
+                if evaluate:
+                    # Use most probable action for evaluation
+                    _, _, action_probs = self.policy.sample(state)
+                    action = torch.argmax(action_probs, dim=-1, keepdim=True)
+                    log_prob = torch.log(action_probs.gather(-1, action))
+                else:
+                    # Sample action for training
+                    action, log_prob, _ = self.policy.sample(state)
+            
+            return action.detach().cpu().numpy()[0], log_prob.detach().cpu().numpy()[0], value.detach().cpu().numpy()[0]
+        else:
+            # Continuous actions
+            with torch.no_grad():
+                if evaluate:
+                    # Use mean action for evaluation
+                    _, _, action = self.policy.sample(state)
+                    # For evaluation, we still need the log probability
+                    _, log_prob, _ = self.policy.evaluate(state, action)
+                else:
+                    # Sample action for training
+                    action, log_prob, _ = self.policy.sample(state)
+                
+            return action.detach().cpu().numpy()[0], log_prob.detach().cpu().numpy()[0], value.detach().cpu().numpy()[0]
+
+    def select_actions_vec(self, states, evaluate=False):
+        """
+        Select actions for multiple states (vectorized version).
+        
+        Args:
+            states: Batch of states
+            evaluate (bool): Whether to evaluate (use mean) or explore (sample)
+            
+        Returns:
+            numpy.ndarray: Batch of selected actions
+            numpy.ndarray: Batch of log probabilities
+            numpy.ndarray: Batch of value estimates
+        """
+        # Handle empty states case (can happen during evaluation)
+        if states.size == 0 or len(states.shape) < 2:
+            return np.array([]), np.array([]), np.array([])
+        
+        # Convert to tensor
+        states = torch.FloatTensor(states).to(self.device)
+        
+        # Get value estimates
+        values = self.value_net(states)
+        
+        with torch.no_grad():
+            if self.discrete:
+                # Discrete actions
+                if evaluate:
+                    # Use most probable action for evaluation
+                    _, _, action_probs = self.policy.sample(states)
+                    actions = torch.argmax(action_probs, dim=-1, keepdim=True)
+                    log_probs = torch.log(action_probs.gather(-1, actions))
+                else:
+                    # Sample action for training
+                    actions, log_probs, _ = self.policy.sample(states)
+            else:
+                # Continuous actions
+                if evaluate:
+                    # Use mean action for evaluation
+                    _, _, actions = self.policy.sample(states)
+                    # For evaluation, we still need the log probabilities
+                    _, log_probs, _ = self.policy.evaluate(states, actions)
+                else:
+                    # Sample action for training
+                    actions, log_probs, _ = self.policy.sample(states)
+                
+        return actions.detach().cpu().numpy(), log_probs.detach().cpu().numpy(), values.detach().cpu().numpy()
+
+    def get_value(self, state):
+        """
+        Get value estimate for a state.
+        
+        Args:
+            state: Current state
+            
+        Returns:
+            float: Value estimate
+        """
+        state = torch.FloatTensor(state).to(self.device)
+        with torch.no_grad():
+            value = self.value_net(state)
+        return value.detach().cpu().numpy()
+
+    def update_parameters(self, rollouts):
+        """
+        Update policy and value parameters using PPO with KL-divergence constraint.
+        
+        Args:
+            rollouts: RolloutStorage containing batch of experiences
+            
+        Returns:
+            tuple: Loss values and metrics for logging
+        """
+        # Get rollout data
+        rollout_data = rollouts.get_data()
+        states = torch.FloatTensor(rollout_data['states']).to(self.device)
+        actions = torch.FloatTensor(rollout_data['actions']).to(self.device)
+        returns = torch.FloatTensor(rollout_data['returns']).to(self.device).view(-1, 1)
+        masks = torch.FloatTensor(rollout_data['masks']).to(self.device).view(-1, 1)
+        old_log_probs = torch.FloatTensor(rollout_data['log_probs']).to(self.device).view(-1, 1)
+        advantages = torch.FloatTensor(rollout_data['advantages']).to(self.device).view(-1, 1)
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Convert discrete actions to long tensors for indexing if needed
+        if self.discrete and actions.shape[-1] == 1:
+            actions = actions.long()
+        
+        # Training info for logging
+        value_loss_epoch = 0
+        policy_loss_epoch = 0
+        entropy_epoch = 0
+        kl_divergence_epoch = 0
+        
+        # Create batches for multiple epochs of training on the same data
+        batch_size = states.size(0)
+        mini_batch_size = batch_size // self.num_mini_batch
+        
+        # Compute old action probabilities for KL-divergence calculation
+        with torch.no_grad():
+            if self.discrete:
+                old_action_logits = self.policy(states)
+                old_action_probs = F.softmax(old_action_logits, dim=-1)
+            else:
+                old_means, old_log_stds = self.policy(states)
+                old_stds = old_log_stds.exp()
+        
+        for _ in range(self.ppo_epoch):
+            # Generate random indices for creating mini-batches
+            indices = torch.randperm(batch_size).to(self.device)
+            
+            for start_idx in range(0, batch_size, mini_batch_size):
+                # Extract mini-batch indices
+                end_idx = min(start_idx + mini_batch_size, batch_size)
+                mb_indices = indices[start_idx:end_idx]
+                
+                # Get mini-batch data
+                mb_states = states[mb_indices]
+                mb_actions = actions[mb_indices]
+                mb_returns = returns[mb_indices]
+                mb_masks = masks[mb_indices]
+                mb_old_log_probs = old_log_probs[mb_indices]
+                mb_advantages = advantages[mb_indices]
+                
+                # Evaluate actions and get current log probs and entropy
+                if self.discrete:
+                    # For discrete actions
+                    action_logits = self.policy(mb_states)
+                    action_probs = F.softmax(action_logits, dim=-1)
+                    log_probs = F.log_softmax(action_logits, dim=-1)
+                    
+                    if mb_actions.shape[-1] == 1:  # If actions are indices
+                        # Calculate entropy - ensure it's a scalar by taking mean
+                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
+                        mb_new_log_probs = torch.gather(log_probs, 1, mb_actions)
+                    else:  # If actions are one-hot encoded
+                        # Calculate entropy - ensure it's a scalar by taking mean
+                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
+                        mb_new_log_probs = (mb_actions * log_probs).sum(dim=-1, keepdim=True)
+                    
+                    # Calculate KL divergence between old and new policy
+                    mb_old_action_probs = old_action_probs[mb_indices]
+                    # Avoid numerical instability
+                    mb_old_action_probs = torch.clamp(mb_old_action_probs, 1e-10, 1.0)
+                    action_probs = torch.clamp(action_probs, 1e-10, 1.0)
+                    
+                    # Make sure KL divergence is a scalar
+                    kl_divergence = (mb_old_action_probs * 
+                                    torch.log(mb_old_action_probs / action_probs)).sum(dim=-1).mean()
+                else:
+                    # For continuous actions
+                    means, log_stds = self.policy(mb_states)
+                    stds = log_stds.exp()
+                    
+                    # Get log probabilities
+                    normal = torch.distributions.Normal(means, stds)
+                    mb_new_log_probs = normal.log_prob(mb_actions).sum(dim=-1, keepdim=True)
+                    
+                    # Compute entropy and ensure it's a scalar
+                    dist_entropy = normal.entropy()
+                    if dist_entropy.dim() > 0:
+                        dist_entropy = dist_entropy.mean()
+                    
+                    # Get old distribution parameters for this mini-batch
+                    mb_old_means = old_means[mb_indices]
+                    mb_old_stds = old_stds[mb_indices]
+                    
+                    # Calculate KL divergence between old and new policy
+                    # For multivariate Gaussian with diagonal covariance, KL is:
+                    # 0.5 * sum(log(new_var/old_var) + (old_var + (old_mean - new_mean)²)/new_var - 1)
+                    kl_term = ((log_stds - torch.log(mb_old_stds)).sum(dim=-1) +
+                            ((mb_old_stds.pow(2) + (mb_old_means - means).pow(2)) / 
+                            stds.pow(2)).sum(dim=-1) - 
+                            means.shape[-1])
+                    # Make sure KL divergence is a scalar
+                    kl_divergence = 0.5 * kl_term.mean()                
+                
+                
+                # Get current value prediction
+                values = self.value_net(mb_states)
+                
+                # Calculate policy loss with KL penalty
+                # First, calculate the surrogate objective
+                ratios = torch.exp(mb_new_log_probs - mb_old_log_probs)
+                surrogate = ratios * mb_advantages
+                
+                # Apply KL-divergence penalty
+                if self.kl_adaptive:
+                    # Adaptive KL penalty based on how far we are from the target
+                    kl_penalty = self.kl_coef * kl_divergence
+                    # Additional penalty if KL divergence exceeds cutoff threshold
+                    if kl_divergence > self.kl_cutoff_factor * self.kl_target:
+                        kl_penalty += self.kl_cutoff_coef * (
+                            kl_divergence - self.kl_cutoff_factor * self.kl_target).pow(2)
+                else:
+                    # Fixed KL penalty
+                    kl_penalty = self.kl_coef * kl_divergence
+                
+                # Final policy loss (ensure it's a scalar)
+                policy_loss = -surrogate.mean() + kl_penalty
+                
+                # Value loss (simple MSE) - ensure it's a scalar
+                value_loss = 0.5 * F.mse_loss(values, mb_returns)
+                
+                # Combined loss with value and entropy terms
+                loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * dist_entropy
+                
+                # Make sure loss is a scalar before calling backward()
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                
+                # Update policy and value networks
+                self.policy_optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
+                loss.backward()
+                
+                # Gradient clipping
+                if self.max_grad_norm > 0:
+                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                
+                self.policy_optimizer.step()
+                self.value_optimizer.step()
+                
+                # Accumulate epoch statistics - ensure we're getting scalar values
+                value_loss_epoch += value_loss.item()
+                policy_loss_epoch += policy_loss.item()
+                # Convert entropy to scalar before adding to epoch total
+                entropy_epoch += dist_entropy.item()
+                kl_divergence_epoch += kl_divergence.item()
+        
+        # Calculate average statistics
+        num_updates = self.ppo_epoch * self.num_mini_batch
+        value_loss_epoch /= num_updates
+        policy_loss_epoch /= num_updates
+        entropy_epoch /= num_updates
+        kl_divergence_epoch /= num_updates
+        
+        # Update KL coefficient if adaptive
+        if self.kl_adaptive:
+            # Increase KL coefficient if KL divergence is too high
+            if kl_divergence_epoch > 1.5 * self.kl_target:
+                self.kl_coef *= 1.5
+            # Decrease KL coefficient if KL divergence is too low
+            elif kl_divergence_epoch < 0.5 * self.kl_target:
+                self.kl_coef /= 1.5
+            # Keep coefficient within reasonable bounds
+            self.kl_coef = max(0.05, min(5.0, self.kl_coef))
+        
+        return value_loss_epoch, policy_loss_epoch, entropy_epoch, kl_divergence_epoch, self.kl_coef
+    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
+        """
+        Save agent parameters to a checkpoint file.
+        
+        Args:
+            env_name (str): Environment name for checkpoint filename
+            suffix (str): Additional suffix for checkpoint filename
+            ckpt_path (str): Path to save checkpoint, if None uses default
+        """
+        if not os.path.exists('checkpoints/'):
+            os.makedirs('checkpoints/')
+            
+        if ckpt_path is None:
+            ckpt_path = f"checkpoints/ppo_kl_checkpoint_{env_name}_{suffix}"
+            
+        print(f'Saving models to {ckpt_path}')
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'value_net_state_dict': self.value_net.state_dict(),
+            'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
+            'value_optimizer_state_dict': self.value_optimizer.state_dict(),
+            'kl_coef': self.kl_coef
+        }, ckpt_path)
+
+    def load_checkpoint(self, ckpt_path, evaluate=False):
+        """
+        Load agent parameters from a checkpoint file.
+        
+        Args:
+            ckpt_path (str): Path to checkpoint file
+            evaluate (bool): Whether to set networks to evaluation mode
+        """
+        print(f'Loading models from {ckpt_path}')
+        if ckpt_path is not None:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.policy.load_state_dict(checkpoint['policy_state_dict'])
+            self.value_net.load_state_dict(checkpoint['value_net_state_dict'])
+            self.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state_dict'])
+            self.value_optimizer.load_state_dict(checkpoint['value_optimizer_state_dict'])
+            
+            # Load KL coefficient if present
+            if 'kl_coef' in checkpoint:
+                self.kl_coef = checkpoint['kl_coef']
+
+            if evaluate:
+                self.policy.eval()
+                self.value_net.eval()
+            else:
+                self.policy.train()
+                self.value_net.train()
