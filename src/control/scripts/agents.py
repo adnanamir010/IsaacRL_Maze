@@ -12,6 +12,8 @@ class SAC(object):
     Soft Actor-Critic (SAC) agent implementation.
     SAC is an off-policy actor-critic deep RL algorithm based on the maximum entropy
     reinforcement learning framework.
+    
+    Can be configured to use single or twin critic, and different entropy approaches.
     """
     def __init__(self, num_inputs, action_space, args):
         """
@@ -21,6 +23,9 @@ class SAC(object):
             num_inputs (int): Dimension of state space
             action_space: Action space with shape and bounds
             args: Configuration arguments
+                Can include additional fields:
+                - use_twin_critic: Whether to use twin critic (True) or single critic (False)
+                - entropy_mode: "none", "fixed", or "adaptive"
         """
         # Algorithm parameters
         self.gamma = args.gamma                           # Discount factor
@@ -28,7 +33,19 @@ class SAC(object):
         self.alpha = args.alpha                           # Temperature parameter for entropy
         self.policy_type = args.policy                    # Policy type (Gaussian or Deterministic)
         self.target_update_interval = args.target_update_interval  # Frequency of target network updates
-        self.automatic_entropy_tuning = args.automatic_entropy_tuning  # Whether to tune entropy automatically
+        
+        # Special configuration parameters with defaults for backward compatibility
+        self.use_twin_critic = getattr(args, 'use_twin_critic', True)  # Default to twin critic
+        self.entropy_mode = getattr(args, 'entropy_mode', 'adaptive')  # Default to adaptive entropy
+        self.automatic_entropy_tuning = (self.entropy_mode == 'adaptive')
+        
+        # If entropy mode is "none", set alpha to 0
+        if self.entropy_mode == "none":
+            self.alpha = 0.0
+            self.automatic_entropy_tuning = False
+        elif self.entropy_mode == "fixed":
+            # Use provided alpha value
+            self.automatic_entropy_tuning = False
 
         # Device setup
         self.device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
@@ -199,15 +216,23 @@ class SAC(object):
                 # Compute the soft value
                 next_q1_target = torch.sum(next_state_probs * qf1_next_target, dim=1, keepdim=True)
                 next_q2_target = torch.sum(next_state_probs * qf2_next_target, dim=1, keepdim=True)
-                min_qf_next_target = torch.min(next_q1_target, next_q2_target) - self.alpha * next_state_log_pi
+                
+                if self.use_twin_critic:
+                    min_qf_next_target = torch.min(next_q1_target, next_q2_target) - self.alpha * next_state_log_pi
+                else:
+                    # Use only the first critic for single critic mode
+                    min_qf_next_target = next_q1_target - self.alpha * next_state_log_pi
             else:
                 # For continuous actions
                 # Sample next action and compute Q-values
                 next_state_action, next_state_log_pi, _ = self.policy.sample(next_state_batch)
                 qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
                 
-                # Take minimum of Q-values to mitigate positive bias
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+                # Take minimum of Q-values if using twin critic, otherwise use first critic
+                if self.use_twin_critic:
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+                else:
+                    min_qf_next_target = qf1_next_target - self.alpha * next_state_log_pi
             
             # Compute target Q-value
             next_q_value = reward_batch + mask_batch * self.gamma * min_qf_next_target
@@ -222,10 +247,14 @@ class SAC(object):
             # Continuous actions
             qf1, qf2 = self.critic(state_batch, action_batch)
         
-        # Compute critic loss
+        # Compute critic loss (use both critics or just the first one)
         qf1_loss = F.mse_loss(qf1, next_q_value)
-        qf2_loss = F.mse_loss(qf2, next_q_value)
-        qf_loss = qf1_loss + qf2_loss
+        if self.use_twin_critic:
+            qf2_loss = F.mse_loss(qf2, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
+        else:
+            qf2_loss = torch.tensor(0.)  # Dummy value for single critic
+            qf_loss = qf1_loss
 
         # Update critics
         self.critic_optim.zero_grad()
@@ -243,14 +272,14 @@ class SAC(object):
             # Get Q-values for all actions
             with torch.no_grad():
                 qf1, qf2 = self.critic(state_batch)
-                min_qf = torch.min(qf1, qf2)
+                if self.use_twin_critic:
+                    min_qf = torch.min(qf1, qf2)
+                else:
+                    min_qf = qf1
             
-            # KL divergence term
-            if self.automatic_entropy_tuning:
-                entropy = -torch.sum(action_probs * log_action_probs, dim=1, keepdim=True)
-                entropy_term = self.alpha * entropy
-            else:
-                entropy_term = 0
+            # KL divergence term (entropy)
+            entropy = -torch.sum(action_probs * log_action_probs, dim=1, keepdim=True)
+            entropy_term = self.alpha * entropy  # Will be 0 if entropy_mode is "none"
             
             # Compute the expected Q-value
             expected_q = torch.sum(action_probs * min_qf, dim=1, keepdim=True)
@@ -262,7 +291,10 @@ class SAC(object):
             pi, log_pi, _ = self.policy.sample(state_batch)
             
             qf1_pi, qf2_pi = self.critic(state_batch, pi)
-            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+            if self.use_twin_critic:
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+            else:
+                min_qf_pi = qf1_pi
             
             # Policy loss with entropy regularization
             policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
@@ -271,7 +303,7 @@ class SAC(object):
         policy_loss.backward()
         self.policy_optim.step()
 
-        # Update temperature parameter alpha if automatic tuning is enabled
+        # Update temperature parameter alpha if adaptive entropy tuning is enabled
         if self.automatic_entropy_tuning:
             if self.discrete:
                 # For discrete actions
@@ -299,6 +331,64 @@ class SAC(object):
             soft_update(self.critic_target, self.critic, self.tau)
 
         return qf1_loss.item(), qf2_loss.item(), policy_loss.item(), alpha_loss.item(), alpha_tlogs.item()
+
+    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
+        """
+        Save agent parameters to a checkpoint file.
+        
+        Args:
+            env_name (str): Environment name for checkpoint filename
+            suffix (str): Additional suffix for checkpoint filename
+            ckpt_path (str): Path to save checkpoint, if None uses default
+        """
+        if not os.path.exists('checkpoints/'):
+            os.makedirs('checkpoints/')
+            
+        if ckpt_path is None:
+            ckpt_path = f"checkpoints/sac_checkpoint_{env_name}_{suffix}"
+            
+        print(f'Saving models to {ckpt_path}')
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'critic_target_state_dict': self.critic_target.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optim.state_dict(),
+            'policy_optimizer_state_dict': self.policy_optim.state_dict(),
+            'use_twin_critic': self.use_twin_critic,
+            'entropy_mode': self.entropy_mode,
+            'alpha': self.alpha,
+        }, ckpt_path)
+
+    def load_checkpoint(self, ckpt_path, evaluate=False):
+        """
+        Load agent parameters from a checkpoint file.
+        
+        Args:
+            ckpt_path (str): Path to checkpoint file
+            evaluate (bool): Whether to set networks to evaluation mode
+        """
+        print(f'Loading models from {ckpt_path}')
+        if ckpt_path is not None:
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            self.policy.load_state_dict(checkpoint['policy_state_dict'])
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+            self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+            self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
+            
+            # Load configuration if available
+            self.use_twin_critic = checkpoint.get('use_twin_critic', True)
+            self.entropy_mode = checkpoint.get('entropy_mode', 'adaptive')
+            self.alpha = checkpoint.get('alpha', self.alpha)
+
+            if evaluate:
+                self.policy.eval()
+                self.critic.eval()
+                self.critic_target.eval()
+            else:
+                self.policy.train()
+                self.critic.train()
+                self.critic_target.train()
 
     def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
         """

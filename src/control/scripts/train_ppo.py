@@ -20,6 +20,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='PyTorch PPO-CLIP Args')
     parser.add_argument('--env-name', default="VectorizedDD",
                     help='Environment name (default: VectorizedDD)')
+    parser.add_argument('--obstacle-shape', default="square",
+                help='Obstacle shape: circular | square (default: square)')
     parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
                     help='Discount factor for reward (default: 0.99)')
     parser.add_argument('--tau', type=float, default=0.95, metavar='G',
@@ -110,14 +112,14 @@ def main():
         # Use our custom environment
         if args.num_envs == 1 and render_mode:
             # Single environment with rendering
-            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode)
+            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode, obstacle_shape=args.obstacle_shape)
             vec_env = gym.vector.SyncVectorEnv([env_fn])
         else:
             # Multiple environments or no rendering
-            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed)
+            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed, obstacle_shape=args.obstacle_shape)
         
         # Create a single environment for evaluation
-        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100)
+        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100, obstacle_shape=args.obstacle_shape)
     else:
         # Use standard Gym environment
         vec_env = gym.vector.make(args.env_name, num_envs=args.num_envs, asynchronous=False)

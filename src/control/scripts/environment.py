@@ -13,7 +13,7 @@ class VectorizedDDEnv(gym.Env):
     """
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 30}
     
-    def __init__(self, render_mode=None, stage_size=720, obstacle_size=8.0):
+    def __init__(self, render_mode=None, stage_size=720, obstacle_size=8.0, obstacle_shape="circular"):
         """
         Initialize the robot environment.
         
@@ -21,6 +21,7 @@ class VectorizedDDEnv(gym.Env):
             render_mode: Mode for rendering the environment ('human', 'rgb_array', or None)
             stage_size: Size of the stage in pixels (square)
             obstacle_size: Size of the obstacle cubes
+            obstacle_shape: Shape of obstacles ('circular' or 'square')
         """
         super().__init__()
         
@@ -30,6 +31,7 @@ class VectorizedDDEnv(gym.Env):
         self.stage_width = 96.0          # Stage width in meters (matches original)
         self.stage_height = 96.0         # Stage height in meters (matches original)
         self.obstacle_size = obstacle_size
+        self.obstacle_shape = obstacle_shape  # Shape of obstacles ('circular' or 'square')
         
         # Robot physical parameters
         self.track_width = 1.1           # Track width between wheels
@@ -125,7 +127,7 @@ class VectorizedDDEnv(gym.Env):
         
         # Store obstacle positions
         self.obstacle_positions = []
-        self.obstacle_list = []  # Will store [x, y, radius] for each obstacle
+        self.obstacle_list = []  # Will store obstacle data based on shape type
         self.boundary_margin = 5.0  # Distance from boundaries to consider collision
         
     def reset(self, seed=None, options=None):
@@ -256,7 +258,7 @@ class VectorizedDDEnv(gym.Env):
     
     def _check_collisions_simple(self):
         """
-        Check collisions using a simpler distance-based method.
+        Check collisions using a method appropriate for the obstacle shape.
         
         Returns:
             bool: True if collision detected, False otherwise
@@ -268,15 +270,33 @@ class VectorizedDDEnv(gym.Env):
         if (x < -48 + self.boundary_margin or x > 48 - self.boundary_margin or
             y < -48 + self.boundary_margin or y > 48 - self.boundary_margin):
             return True
+        
+        # Check collisions based on obstacle shape
+        if self.obstacle_shape == "circular":
+            # For circular obstacles (circle-circle collision)
+            for obs_x, obs_y, obs_radius in self.obstacle_list:
+                # Calculate distance between robot and obstacle center
+                distance = np.sqrt((x - obs_x)**2 + (y - obs_y)**2)
+                
+                # Check if distance is less than sum of radii
+                if distance < (self.robot_radius + obs_radius):
+                    return True
+        
+        else:  # "square" obstacles
+            # For square obstacles (circle-rectangle collision)
+            robot_radius = self.robot_radius
             
-        # Check collisions with obstacles (circle-circle collision)
-        for obs_x, obs_y, obs_radius in self.obstacle_list:
-            # Calculate distance between robot and obstacle center
-            distance = np.sqrt((x - obs_x)**2 + (y - obs_y)**2)
-            
-            # Check if distance is less than sum of radii
-            if distance < (self.robot_radius + obs_radius):
-                return True
+            for obs_x, obs_y, half_width, half_height in self.obstacle_list:
+                # Calculate the closest point on the rectangle to the circle center
+                closest_x = max(obs_x - half_width, min(x, obs_x + half_width))
+                closest_y = max(obs_y - half_height, min(y, obs_y + half_height))
+                
+                # Calculate distance between closest point and circle center
+                distance = np.sqrt((x - closest_x)**2 + (y - closest_y)**2)
+                
+                # Check if distance is less than robot radius
+                if distance < robot_radius:
+                    return True
                 
         return False
     
@@ -306,7 +326,7 @@ class VectorizedDDEnv(gym.Env):
     
     def _simulate_lidar(self):
         """
-        Simulate LIDAR using ray-casting against obstacles.
+        Simulate LIDAR using ray-casting based on the obstacle shape.
         
         Returns:
             lidar_data: Array of distances from robot to obstacles
@@ -358,37 +378,79 @@ class VectorizedDDEnv(gym.Env):
                 if -48 <= intersect_x <= 48 and t > 0:
                     lidar_data[i] = min(lidar_data[i], t)
             
-            # Check intersection with each obstacle
-            for obs_x, obs_y, obs_radius in self.obstacle_list:
-                # Vector from robot to obstacle center
-                to_center_x = obs_x - x
-                to_center_y = obs_y - y
-                
-                # Calculate dot product (projection of obstacle-center vector onto ray)
-                dot_product = to_center_x * ray_dir_x + to_center_y * ray_dir_y
-                
-                # If dot product is negative, obstacle is behind the ray
-                if dot_product < 0:
-                    continue
-                
-                # Find closest point on ray to obstacle center
-                closest_x = x + dot_product * ray_dir_x
-                closest_y = y + dot_product * ray_dir_y
-                
-                # Distance from closest point to obstacle center
-                closest_distance = np.sqrt((closest_x - obs_x)**2 + (closest_y - obs_y)**2)
-                
-                # If this distance is greater than obstacle radius, ray doesn't hit
-                if closest_distance > obs_radius:
-                    continue
-                
-                # Calculate distance from robot to intersection point
-                # Using Pythagorean theorem
-                intersection_distance = dot_product - np.sqrt(obs_radius**2 - closest_distance**2)
-                
-                # Update lidar reading if this is closer
-                if 0 < intersection_distance < lidar_data[i]:
-                    lidar_data[i] = intersection_distance
+            # Check intersection with obstacles based on shape
+            if self.obstacle_shape == "circular":
+                # Circular obstacle intersection
+                for obs_x, obs_y, obs_radius in self.obstacle_list:
+                    # Vector from robot to obstacle center
+                    to_center_x = obs_x - x
+                    to_center_y = obs_y - y
+                    
+                    # Calculate dot product (projection of obstacle-center vector onto ray)
+                    dot_product = to_center_x * ray_dir_x + to_center_y * ray_dir_y
+                    
+                    # If dot product is negative, obstacle is behind the ray
+                    if dot_product < 0:
+                        continue
+                    
+                    # Find closest point on ray to obstacle center
+                    closest_x = x + dot_product * ray_dir_x
+                    closest_y = y + dot_product * ray_dir_y
+                    
+                    # Distance from closest point to obstacle center
+                    closest_distance = np.sqrt((closest_x - obs_x)**2 + (closest_y - obs_y)**2)
+                    
+                    # If this distance is greater than obstacle radius, ray doesn't hit
+                    if closest_distance > obs_radius:
+                        continue
+                    
+                    # Calculate distance from robot to intersection point
+                    # Using Pythagorean theorem
+                    intersection_distance = dot_product - np.sqrt(obs_radius**2 - closest_distance**2)
+                    
+                    # Update lidar reading if this is closer
+                    if 0 < intersection_distance < lidar_data[i]:
+                        lidar_data[i] = intersection_distance
+            
+            else:  # "square" obstacles
+                # Square obstacle intersection
+                for obs_x, obs_y, half_width, half_height in self.obstacle_list:
+                    # Obstacle bounds
+                    x_min = obs_x - half_width
+                    x_max = obs_x + half_width
+                    y_min = obs_y - half_height
+                    y_max = obs_y + half_height
+                    
+                    # Check intersection with each side of the rectangle
+                    # We need to check all four sides of the rectangle
+                    
+                    # Check intersection with bottom side (y = y_min)
+                    if ray_dir_y != 0:  # Avoid division by zero
+                        t_bottom = (y_min - y) / ray_dir_y
+                        x_intersect = x + t_bottom * ray_dir_x
+                        if t_bottom > 0 and x_min <= x_intersect <= x_max:
+                            lidar_data[i] = min(lidar_data[i], t_bottom)
+                    
+                    # Check intersection with top side (y = y_max)
+                    if ray_dir_y != 0:  # Avoid division by zero
+                        t_top = (y_max - y) / ray_dir_y
+                        x_intersect = x + t_top * ray_dir_x
+                        if t_top > 0 and x_min <= x_intersect <= x_max:
+                            lidar_data[i] = min(lidar_data[i], t_top)
+                    
+                    # Check intersection with left side (x = x_min)
+                    if ray_dir_x != 0:  # Avoid division by zero
+                        t_left = (x_min - x) / ray_dir_x
+                        y_intersect = y + t_left * ray_dir_y
+                        if t_left > 0 and y_min <= y_intersect <= y_max:
+                            lidar_data[i] = min(lidar_data[i], t_left)
+                    
+                    # Check intersection with right side (x = x_max)
+                    if ray_dir_x != 0:  # Avoid division by zero
+                        t_right = (x_max - x) / ray_dir_x
+                        y_intersect = y + t_right * ray_dir_y
+                        if t_right > 0 and y_min <= y_intersect <= y_max:
+                            lidar_data[i] = min(lidar_data[i], t_right)
         
         # Clamp values to max range
         lidar_data = np.clip(lidar_data, 0, self.max_lidar_distance)
@@ -455,7 +517,7 @@ class VectorizedDDEnv(gym.Env):
             obstacle_positions: List of positions for obstacles
         
         Returns:
-            obstacle_list: List of [x, y, radius] for each obstacle
+            obstacle_list: List of obstacle data based on shape type
         """
         obstacle_list = []
         
@@ -468,8 +530,14 @@ class VectorizedDDEnv(gym.Env):
                 col = pos_value % 3
                 coords = self.regions[region_idx][row][col]
                 
-                # Store obstacle as [x, y, radius]
-                obstacle_list.append([coords[0], coords[1], self.obstacle_size/2])
+                # Store obstacle data based on shape
+                if self.obstacle_shape == "circular":
+                    # For circular: [x, y, radius]
+                    obstacle_list.append([coords[0], coords[1], self.obstacle_size/2])
+                else:
+                    # For square: [x, y, half_width, half_height]
+                    half_size = self.obstacle_size/2
+                    obstacle_list.append([coords[0], coords[1], half_size, half_size])
                 
                 # Calculate drawing coordinates (for visualization)
                 pt1 = (int((self.stage_width/2 - self.obstacle_size/2 + coords[0])/self.pixel_to_meter), 
@@ -571,19 +639,41 @@ class VectorizedDDEnv(gym.Env):
                     goal_size, goal_size
                 ))
                 
-                # Draw obstacles
-                for obs_x, obs_y, obs_radius in self.obstacle_list:
-                    # Convert to screen coordinates
-                    obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
-                    # Scale radius to pixels
-                    obs_screen_radius = int(obs_radius * self.stage_size/self.stage_width)
-                    
-                    # REMOVED: Debug print statement
-                    
-                    # Draw obstacle with filled circle and border
-                    pygame.draw.circle(self.window, (100, 100, 100), (obs_screen_x, obs_screen_y), obs_screen_radius)  # Darker gray
-                    pygame.draw.circle(self.window, (0, 0, 0), (obs_screen_x, obs_screen_y), obs_screen_radius, 2)  # Black border, thicker                
-                    
+                # Draw obstacles based on shape
+                if self.obstacle_shape == "circular":
+                    # Draw circular obstacles
+                    for obs_x, obs_y, obs_radius in self.obstacle_list:
+                        # Convert to screen coordinates
+                        obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
+                        # Scale radius to pixels
+                        obs_screen_radius = int(obs_radius * self.stage_size/self.stage_width)
+                        
+                        # Draw obstacle with filled circle and border
+                        pygame.draw.circle(self.window, (100, 100, 100), (obs_screen_x, obs_screen_y), obs_screen_radius)  # Darker gray
+                        pygame.draw.circle(self.window, (0, 0, 0), (obs_screen_x, obs_screen_y), obs_screen_radius, 2)  # Black border, thicker
+                
+                else:  # "square" obstacles
+                    # Draw square obstacles
+                    for obs_x, obs_y, half_width, half_height in self.obstacle_list:
+                        # Convert to screen coordinates
+                        obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
+                        # Scale half width and height to pixels
+                        half_width_pixels = int(half_width * self.stage_size/self.stage_width)
+                        half_height_pixels = int(half_height * self.stage_size/self.stage_height)
+                        
+                        # Create rectangle for drawing
+                        rect = pygame.Rect(
+                            obs_screen_x - half_width_pixels,
+                            obs_screen_y - half_height_pixels,
+                            half_width_pixels * 2,
+                            half_height_pixels * 2
+                        )
+                        
+                        # Draw filled rectangle
+                        pygame.draw.rect(self.window, (100, 100, 100), rect)
+                        # Draw border
+                        pygame.draw.rect(self.window, (0, 0, 0), rect, 2)
+                
                 # Draw robot
                 robot_pos = world_to_screen(self.robot_pose[0], self.robot_pose[1])
                 robot_radius = int(self.robot_radius * self.stage_size/self.stage_width)
@@ -629,9 +719,9 @@ class VectorizedDDEnv(gym.Env):
                     dist_text = font.render(f"Distance to goal: {dist:.1f}m", True, (0, 0, 0))
                     self.window.blit(dist_text, (10, 60))
                     
-                    # ADDED: Debug info
-                    debug_text = font.render(f"Obstacles: {len(self.obstacle_list)}", True, (0, 0, 0))
-                    self.window.blit(debug_text, (10, 85))
+                    # Obstacle info
+                    obstacle_text = font.render(f"Obstacles: {len(self.obstacle_list)} ({self.obstacle_shape})", True, (0, 0, 0))
+                    self.window.blit(obstacle_text, (10, 85))
                 except Exception as e:
                     print(f"Text rendering error: {e}")
                 
@@ -696,15 +786,39 @@ class VectorizedDDEnv(gym.Env):
                 goal_size, goal_size
             ))
             
-            # Draw obstacles
-            for obs_x, obs_y, obs_radius in self.obstacle_list:
-                # Convert to screen coordinates
-                obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
-                obs_screen_radius = int(obs_radius * self.stage_size/self.stage_width)
-                
-                # Draw obstacle
-                pygame.draw.circle(surf, (180, 180, 180), (obs_screen_x, obs_screen_y), obs_screen_radius)
-                pygame.draw.circle(surf, (100, 100, 100), (obs_screen_x, obs_screen_y), obs_screen_radius, 1)
+            # Draw obstacles based on shape
+            if self.obstacle_shape == "circular":
+                # Draw circular obstacles
+                for obs_x, obs_y, obs_radius in self.obstacle_list:
+                    # Convert to screen coordinates
+                    obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
+                    obs_screen_radius = int(obs_radius * self.stage_size/self.stage_width)
+                    
+                    # Draw obstacle
+                    pygame.draw.circle(surf, (180, 180, 180), (obs_screen_x, obs_screen_y), obs_screen_radius)
+                    pygame.draw.circle(surf, (100, 100, 100), (obs_screen_x, obs_screen_y), obs_screen_radius, 1)
+            
+            else:  # "square" obstacles
+                # Draw square obstacles
+                for obs_x, obs_y, half_width, half_height in self.obstacle_list:
+                    # Convert to screen coordinates
+                    obs_screen_x, obs_screen_y = world_to_screen(obs_x, obs_y)
+                    # Scale half width and height to pixels
+                    half_width_pixels = int(half_width * self.stage_size/self.stage_width)
+                    half_height_pixels = int(half_height * self.stage_size/self.stage_height)
+                    
+                    # Create rectangle for drawing
+                    rect = pygame.Rect(
+                        obs_screen_x - half_width_pixels,
+                        obs_screen_y - half_height_pixels,
+                        half_width_pixels * 2,
+                        half_height_pixels * 2
+                    )
+                    
+                    # Draw filled rectangle
+                    pygame.draw.rect(surf, (180, 180, 180), rect)
+                    # Draw border
+                    pygame.draw.rect(surf, (100, 100, 100), rect, 1)
             
             # Draw robot
             robot_pos = world_to_screen(self.robot_pose[0], self.robot_pose[1])
@@ -769,13 +883,14 @@ class VectorizedDDEnv(gym.Env):
 
 
 # For the vectorized environment implementation, we need a vectorized wrapper
-def make_vectorized_env(num_envs, seed=None):
+def make_vectorized_env(num_envs, seed=None, obstacle_shape="circular"):
     """
     Create a vectorized environment for parallel training.
     
     Args:
         num_envs: Number of environments to run in parallel
         seed: Random seed for reproducibility
+        obstacle_shape: Shape of obstacles ('circular' or 'square')
         
     Returns:
         envs: Vectorized environment
@@ -784,7 +899,7 @@ def make_vectorized_env(num_envs, seed=None):
     
     def make_env(index):
         def _init():
-            env = VectorizedDDEnv()
+            env = VectorizedDDEnv(obstacle_shape=obstacle_shape)
             env.reset(seed=seed + index if seed is not None else None)
             return env
         return _init

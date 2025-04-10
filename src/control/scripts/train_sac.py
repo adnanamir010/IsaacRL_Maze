@@ -21,6 +21,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
     parser.add_argument('--env-name', default="VectorizedDD",
                     help='Environment name (default: VectorizedDD)')
+    parser.add_argument('--obstacle-shape', default="square",
+                    help='Obstacle shape: circular | square (default: square)')
     parser.add_argument('--policy', default="Gaussian",
                     help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
     parser.add_argument('--eval', type=bool, default=True,
@@ -72,7 +74,13 @@ def parse_arguments():
     parser.add_argument('--num-envs', type=int, default=4,
                     help='Number of parallel environments (default: 4)')
     parser.add_argument('--render', action="store_true",
-                    help='Render visualization (only for training with num-envs=1) (default: False)')
+                    help='Render visualization (only for training with num-envs=1) (default: False)')    
+    parser.add_argument('--use-twin-critic', action="store_true", default=True,
+                    help='Use twin critic (default: True)')
+    parser.add_argument('--entropy-mode', choices=['none', 'fixed', 'adaptive'], default='adaptive',
+                    help='Entropy mode: none, fixed, or adaptive (default: adaptive)')
+    parser.add_argument('--experiment-name', type=str, default=None,
+                    help='Name for this experiment (default: auto-generated)')
 
     return parser.parse_args()
 
@@ -80,6 +88,19 @@ def main():
     """Main training function with vectorized environments and progress bar"""
     # Parse arguments
     args = parse_arguments()
+    
+    # For backward compatibility, set entropy_mode based on automatic_entropy_tuning
+    if hasattr(args, 'automatic_entropy_tuning'):
+        if args.automatic_entropy_tuning:
+            args.entropy_mode = 'adaptive'
+        else:
+            args.entropy_mode = 'fixed'
+    
+    # Generate experiment name if not provided
+    if args.experiment_name is None:
+        critic_type = "Twin" if args.use_twin_critic else "Single"
+        entropy_type = args.entropy_mode.capitalize()
+        args.experiment_name = f"{args.env_name}_{critic_type}Critic_{entropy_type}Entropy"
     
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -96,7 +117,7 @@ def main():
         print("Using CPU")
     
     # Create vectorized environments
-    print(f"Creating {args.num_envs} parallel environments for '{args.env_name}'")
+    print(f"Creating {args.num_envs} parallel environments for '{args.env_name}' with '{args.obstacle_shape}' obstacles")
     
     # Initialize render mode only if explicitly requested and only with a single environment
     render_mode = "human" if args.render and args.num_envs == 1 else None
@@ -107,14 +128,14 @@ def main():
         # Use our custom environment
         if args.num_envs == 1 and render_mode:
             # Single environment with rendering
-            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode)
+            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode, obstacle_shape=args.obstacle_shape)
             vec_env = gym.vector.SyncVectorEnv([env_fn])
         else:
             # Multiple environments or no rendering
-            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed)
+            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed, obstacle_shape=args.obstacle_shape)
         
         # Create a single environment for evaluation
-        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100)
+        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100, obstacle_shape=args.obstacle_shape)
     else:
         # Use standard Gym environment
         vec_env = gym.vector.make(args.env_name, num_envs=args.num_envs, asynchronous=False)
@@ -138,11 +159,19 @@ def main():
     # Set up action space
     action_space = vec_env.single_action_space
     
+    # Log configuration details
+    print(f"\nSAC Configuration:")
+    print(f"- Twin Critic: {args.use_twin_critic}")
+    print(f"- Entropy Mode: {args.entropy_mode}")
+    if args.entropy_mode == 'fixed':
+        print(f"- Alpha Value: {args.alpha}")
+    print()
+    
     # Initialize SAC agent
     agent = SAC(state_dim, action_space, args)
     
     # Set up TensorBoard writer with reduced flush frequency to minimize I/O
-    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.env_name}_vec{args.num_envs}'
+    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.experiment_name}'
     writer = SummaryWriter(log_dir, max_queue=1000, flush_secs=120)
     
     # Create replay memory with state and action dimensions
@@ -270,11 +299,11 @@ def main():
                     
                     # Save model checkpoint periodically
                     if episode_count % args.checkpoint_interval == 0:
-                        agent.save_checkpoint(args.env_name, suffix=f"{episode_count}")
+                        agent.save_checkpoint(args.env_name, suffix=f"{args.experiment_name}_{episode_count}")
                         
                         # Also save replay buffer occasionally for potential resume
                         if episode_count % (args.checkpoint_interval * 5) == 0:
-                            memory.save_buffer(args.env_name, suffix=f"{episode_count}")
+                            memory.save_buffer(args.env_name, suffix=f"{args.experiment_name}_{episode_count}")
             
             # Perform updates if enough samples in memory
             if len(memory) > args.batch_size:
@@ -315,8 +344,8 @@ def main():
         # Final save
         if 'episode_count' in locals() and episode_count > 0:
             print(f"Saving final checkpoint at episode {episode_count}")
-            agent.save_checkpoint(args.env_name, suffix=f"final_{episode_count}")
-            memory.save_buffer(args.env_name, suffix=f"final_{episode_count}")
+            agent.save_checkpoint(args.env_name, suffix=f"{args.experiment_name}_final_{episode_count}")
+            memory.save_buffer(args.env_name, suffix=f"{args.experiment_name}_final_{episode_count}")
         
         # Clean up
         writer.close()
@@ -332,8 +361,10 @@ def main():
             eval_episode_numbers_np = np.array(all_eval_episode_numbers) if all_eval_episode_numbers else None
             eval_rewards_np = np.array(all_eval_rewards) if all_eval_rewards else None
             
+            # Include configuration in the curve name
+            curve_name = f"{args.curve_name}_{args.experiment_name}"
             save_learning_curve(episode_numbers_np, episode_rewards_np, 
-                               eval_episode_numbers_np, eval_rewards_np, args.curve_name)
+                               eval_episode_numbers_np, eval_rewards_np, curve_name)
         
         # Final cleanup
         collect_garbage()

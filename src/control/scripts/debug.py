@@ -3,7 +3,7 @@ from environment import VectorizedDDEnv
 import time
 
 # Test the environment rendering directly (without vectorization)
-env = VectorizedDDEnv(render_mode='human')
+env = VectorizedDDEnv(render_mode='human', obstacle_shape="square")
 obs, _ = env.reset()
 
 # Apply brighter colors for obstacles and regions
