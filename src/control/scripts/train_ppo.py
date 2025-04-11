@@ -30,12 +30,12 @@ def parse_arguments():
                     help='Policy learning rate (default: 3e-4)')
     parser.add_argument('--value-lr', type=float, default=1e-3, metavar='G',
                     help='Value function learning rate (default: 1e-3)')
-    parser.add_argument('--clip-param', type=float, default=0.2, metavar='G',
-                    help='PPO clip parameter (default: 0.2)')
+    parser.add_argument('--clip-param', type=float, default=0.3, metavar='G',
+                    help='PPO clip parameter (default: 0.3)')
     parser.add_argument('--ppo-epoch', type=int, default=10, metavar='G',
                     help='Number of PPO epochs (default: 10)')
-    parser.add_argument('--num-mini-batch', type=int, default=32, metavar='G',
-                    help='Number of PPO mini-batches (default: 32)')
+    parser.add_argument('--num-mini-batch', type=int, default=64, metavar='G',
+                    help='Number of PPO mini-batches (default: 64)')
     parser.add_argument('--value-loss-coef', type=float, default=0.5, metavar='G',
                     help='Value loss coefficient (default: 0.5)')
     parser.add_argument('--entropy-coef', type=float, default=0.01, metavar='G',
@@ -48,8 +48,8 @@ def parse_arguments():
                     help='Random seed (default: 123456)')
     parser.add_argument('--batch-size', type=int, default=2048, metavar='N',
                     help='Batch size for PPO updates (default: 2048)')
-    parser.add_argument('--num-steps', type=int, default=1_000_000, metavar='N',
-                    help='Maximum number of steps (default: 1_000_000)')
+    parser.add_argument('--num-steps', type=int, default=10_000_000, metavar='N',
+                    help='Maximum number of steps (default: 10_000_000)')
     parser.add_argument('--hidden-size', type=int, default=128, metavar='N',
                     help='Hidden size (default: 128)')
     parser.add_argument('--update-interval', type=int, default=2048, metavar='N',
@@ -234,8 +234,11 @@ def main():
                         all_episode_rewards.append(episode_rewards[i])
                         all_episode_numbers.append(episode_count)
                         
+                        # Calculate average reward per step
+                        reward_per_step = episode_rewards[i] / episode_steps[i] if episode_steps[i] > 0 else 0
+                        
                         # Print progress
-                        tqdm.write(f"Episode {episode_count}: Reward={episode_rewards[i]:.2f}, Steps={episode_steps[i]}")
+                        tqdm.write(f"Episode {episode_count}: Reward={episode_rewards[i]:.2f}, Steps={episode_steps[i]}, Reward/Step={reward_per_step:.4f}")
                         
                         # Reset episode stats
                         episode_rewards[i] = 0
@@ -332,7 +335,7 @@ def main():
             eval_rewards_np = np.array(all_eval_rewards) if all_eval_rewards else None
             
             save_learning_curve(episode_numbers_np, episode_rewards_np, 
-                               eval_episode_numbers_np, eval_rewards_np, args.curve_name)
+                               eval_episode_numbers_np, eval_rewards_np, args.curve_name, args.algorithm)
         
         # Final cleanup
         collect_garbage()
@@ -343,8 +346,8 @@ if __name__ == "__main__":
     np.set_printoptions(precision=4, suppress=True, linewidth=120)
     
     # Set up environment variables to limit CPU utilization if needed
-    os.environ['OMP_NUM_THREADS'] = '4'  # Limit OpenMP threads
-    os.environ['MKL_NUM_THREADS'] = '4'  # Limit MKL threads
+    # os.environ['OMP_NUM_THREADS'] = '4'  # Limit OpenMP threads
+    # os.environ['MKL_NUM_THREADS'] = '4'  # Limit MKL threads
     
     # Set CUDA options to optimize memory usage
     if torch.cuda.is_available():

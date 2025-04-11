@@ -14,6 +14,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Evaluate a trained PPO agent')
     parser.add_argument('--env-name', default="VectorizedDD",
                     help='Environment name (default: VectorizedDD)')
+    parser.add_argument('--obstacle-shape', default="square",
+                    help='Obstacle shape: circular | square (default: square)')
     parser.add_argument('--algorithm', default="PPOCLIP", choices=["PPOCLIP", "PPOKL"],
                     help='Algorithm: PPOCLIP | PPOKL (default: PPOCLIP)')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -77,7 +79,7 @@ def main():
     render_mode = 'human' if args.render else None
     
     if args.env_name == "VectorizedDD":
-        env = VectorizedDDEnv(render_mode=render_mode)
+        env = VectorizedDDEnv(render_mode=render_mode, obstacle_shape=args.obstacle_shape)
     else:
         try:
             env = gym.make(args.env_name, render_mode=render_mode)

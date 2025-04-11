@@ -55,7 +55,7 @@ class VectorizedDDEnv(gym.Env):
         # Episode tracking
         self.prev_distance = 0.0
         self.timestep = 0
-        self.max_episode_steps = 200
+        self.max_episode_steps = 220
         
         # Rendering
         self.render_mode = render_mode
@@ -477,7 +477,7 @@ class VectorizedDDEnv(gym.Env):
         at_goal = (20.0 < self.robot_pose[0] < 28.0 and 
                   -28.0 < self.robot_pose[1] < -20.0)
         if at_goal:
-            return 20, True
+            return 200, True
             
         # Get minimum lidar reading
         lidar_data = self._simulate_lidar()
@@ -724,9 +724,6 @@ class VectorizedDDEnv(gym.Env):
                     self.window.blit(obstacle_text, (10, 85))
                 except Exception as e:
                     print(f"Text rendering error: {e}")
-                
-                # ADDED: Draw center marker for debugging
-                pygame.draw.circle(self.window, (255, 0, 255), (self.stage_size//2, self.stage_size//2), 5)
                 
                 # Update display
                 pygame.display.flip()

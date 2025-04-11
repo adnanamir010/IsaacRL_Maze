@@ -390,56 +390,6 @@ class SAC(object):
                 self.critic.train()
                 self.critic_target.train()
 
-    def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
-        """
-        Save agent parameters to a checkpoint file.
-        
-        Args:
-            env_name (str): Environment name for checkpoint filename
-            suffix (str): Additional suffix for checkpoint filename
-            ckpt_path (str): Path to save checkpoint, if None uses default
-        """
-        if not os.path.exists('checkpoints/'):
-            os.makedirs('checkpoints/')
-            
-        if ckpt_path is None:
-            ckpt_path = f"checkpoints/sac_checkpoint_{env_name}_{suffix}"
-            
-        print(f'Saving models to {ckpt_path}')
-        torch.save({
-            'policy_state_dict': self.policy.state_dict(),
-            'critic_state_dict': self.critic.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
-            'critic_optimizer_state_dict': self.critic_optim.state_dict(),
-            'policy_optimizer_state_dict': self.policy_optim.state_dict()
-        }, ckpt_path)
-
-    def load_checkpoint(self, ckpt_path, evaluate=False):
-        """
-        Load agent parameters from a checkpoint file.
-        
-        Args:
-            ckpt_path (str): Path to checkpoint file
-            evaluate (bool): Whether to set networks to evaluation mode
-        """
-        print(f'Loading models from {ckpt_path}')
-        if ckpt_path is not None:
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
-            self.policy.load_state_dict(checkpoint['policy_state_dict'])
-            self.critic.load_state_dict(checkpoint['critic_state_dict'])
-            self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
-            self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-            self.policy_optim.load_state_dict(checkpoint['policy_optimizer_state_dict'])
-
-            if evaluate:
-                self.policy.eval()
-                self.critic.eval()
-                self.critic_target.eval()
-            else:
-                self.policy.train()
-                self.critic.train()
-                self.critic_target.train()
-
 class PPOCLIP(object):
     """
     Proximal Policy Optimization (PPO) with clipped objective.

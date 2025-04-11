@@ -363,8 +363,9 @@ def main():
             
             # Include configuration in the curve name
             curve_name = f"{args.curve_name}_{args.experiment_name}"
+            algorithm_name = f"{critic_type} Critic SAC with {entropy_type} Entropy"
             save_learning_curve(episode_numbers_np, episode_rewards_np, 
-                               eval_episode_numbers_np, eval_rewards_np, curve_name)
+                               eval_episode_numbers_np, eval_rewards_np, curve_name, algorithm_name)
         
         # Final cleanup
         collect_garbage()

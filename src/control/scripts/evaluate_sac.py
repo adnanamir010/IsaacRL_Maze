@@ -14,6 +14,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Evaluate a trained SAC agent')
     parser.add_argument('--env-name', default="VectorizedDD",
                     help='Environment name (default: VectorizedDD)')
+    parser.add_argument('--obstacle-shape', default="square",
+                    help='Obstacle shape: circular | square (default: square)')
     parser.add_argument('--checkpoint', type=str, required=True,
                     help='Path to the checkpoint file')
     parser.add_argument('--seed', type=int, default=123456, metavar='N',
@@ -51,7 +53,7 @@ def main():
     render_mode = 'human' if args.render else None    
 
     if args.env_name == "VectorizedDD":
-        env = VectorizedDDEnv(render_mode=render_mode)
+        env = VectorizedDDEnv(render_mode=render_mode, obstacle_shape=args.obstacle_shape)
     else:
         try:
             env = gym.make(args.env_name, render_mode=render_mode)
