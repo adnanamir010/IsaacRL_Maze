@@ -24,13 +24,21 @@ def parse_arguments():
                     help='Random seed (default: 123456)')
     parser.add_argument('--num-episodes', type=int, default=10,
                     help='Number of evaluation episodes (default: 10)')
-    parser.add_argument('--render', action='store_true', default=False,
+    parser.add_argument('--render', action='store_true', default=True,
                     help='Render the environment (default: False)')
-    parser.add_argument('--hidden-size', type=int, default=128,
+    parser.add_argument('--hidden-size', type=int, default=512,
                     help='Hidden layer size (default: 128)')
     parser.add_argument('--cuda', action="store_true", default=True,
                     help='Run on CUDA if available (default: True)')
-    
+    parser.add_argument('--gamma', type=float, default=0.99, metavar='G',
+                    help='Discount factor for reward (default: 0.99)')
+    parser.add_argument('--tau', type=float, default=0.95, metavar='G',
+                    help='GAE parameter (default: 0.95)')
+    parser.add_argument('--policy-lr', type=float, default=3e-4, metavar='G',
+                    help='Policy learning rate (default: 3e-4)')
+    parser.add_argument('--value-lr', type=float, default=1e-3, metavar='G',
+                    help='Value function learning rate (default: 1e-3)')
+
     # PPO-CLIP specific arguments
     parser.add_argument('--clip-param', type=float, default=0.2,
                     help='PPO clip parameter (default: 0.2)')
