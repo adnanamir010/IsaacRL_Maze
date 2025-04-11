@@ -16,8 +16,8 @@ def parse_arguments():
                     help='Environment name (default: VectorizedDD)')
     parser.add_argument('--algorithm', default="PPOCLIP", choices=["PPOCLIP", "PPOKL"],
                     help='Algorithm: PPOCLIP | PPOKL (default: PPOCLIP)')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                    help='Path to the checkpoint file')
+    parser.add_argument('--checkpoint', type=str, default='D:/NEU Spring 2025/CS 5180 RL Course Work/Final_Project/IsaacRL_Maze/IsaacRL_Maze/checkpoints/ppo_clip_checkpoint_VectorizedDD_final_38',
+                help='Path to the checkpoint file')
     parser.add_argument('--seed', type=int, default=123456, metavar='N',
                     help='Random seed (default: 123456)')
     parser.add_argument('--num-episodes', type=int, default=10,
