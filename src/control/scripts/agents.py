@@ -917,8 +917,9 @@ class PPOKL(object):
         old_log_probs = torch.FloatTensor(rollout_data['log_probs']).to(self.device).view(-1, 1)
         advantages = torch.FloatTensor(rollout_data['advantages']).to(self.device).view(-1, 1)
         
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalize advantages if enabled
+        if hasattr(self, 'normalize_advantages') and self.normalize_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # Convert discrete actions to long tensors for indexing if needed
         if self.discrete and actions.shape[-1] == 1:
@@ -1011,8 +1012,7 @@ class PPOKL(object):
                             stds.pow(2)).sum(dim=-1) - 
                             means.shape[-1])
                     # Make sure KL divergence is a scalar
-                    kl_divergence = 0.5 * kl_term.mean()                
-                
+                    kl_divergence = 0.5 * kl_term.mean()
                 
                 # Get current value prediction
                 values = self.value_net(mb_states)
@@ -1055,7 +1055,8 @@ class PPOKL(object):
                 # Gradient clipping
                 if self.max_grad_norm > 0:
                     policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    # Use stronger gradient clipping for value network to help with high value loss
+                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm * 2)
                 
                 self.policy_optimizer.step()
                 self.value_optimizer.step()
@@ -1063,7 +1064,6 @@ class PPOKL(object):
                 # Accumulate epoch statistics - ensure we're getting scalar values
                 value_loss_epoch += value_loss.item()
                 policy_loss_epoch += policy_loss.item()
-                # Convert entropy to scalar before adding to epoch total
                 entropy_epoch += dist_entropy.item()
                 kl_divergence_epoch += kl_divergence.item()
         
@@ -1083,7 +1083,9 @@ class PPOKL(object):
             elif kl_divergence_epoch < 0.5 * self.kl_target:
                 self.kl_coef /= 1.5
             # Keep coefficient within reasonable bounds
-            self.kl_coef = max(0.05, min(5.0, self.kl_coef))
+            # Use the new minimum KL coefficient parameter
+            min_kl_coef = getattr(self, 'min_kl_coef', 0.2)  # Default to 0.2 if not set
+            self.kl_coef = max(min_kl_coef, min(5.0, self.kl_coef))
         
         return value_loss_epoch, policy_loss_epoch, entropy_epoch, kl_divergence_epoch, self.kl_coef
     def save_checkpoint(self, env_name, suffix="", ckpt_path=None):

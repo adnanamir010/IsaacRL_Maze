@@ -27,7 +27,7 @@ def parse_arguments():
     parser.add_argument('--obstacle-shape', default="square", help='Obstacle shape: circular | square (default: square)')
     
     # Training parameters
-    parser.add_argument('--num-steps', type=int, default=1_000_000, help='Maximum number of steps (default: 1_000_000)')
+    parser.add_argument('--num-steps', type=int, default=500_000, help='Maximum number of steps (default: 1_000_000)')
     parser.add_argument('--batch-size', type=int, default=256, help='Batch size (default: 256)')
     parser.add_argument('--start-steps', type=int, default=5000, help='Steps sampling random actions (default: 5000)')
     parser.add_argument('--updates-per-step', type=int, default=1, help='Updates per step (default: 1)')

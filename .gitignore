@@ -1,3 +1,6 @@
 src/control/scripts/checkpoints/
 src/control/scripts/__pycache__/
 src/control/scripts/runs/
+src/control/scripts/DIR/
+src/control/scripts/learning_curves/
+src/control/scripts/experiment_results/runs/

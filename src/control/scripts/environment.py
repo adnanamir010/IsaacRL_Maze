@@ -458,41 +458,54 @@ class VectorizedDDEnv(gym.Env):
         return lidar_data
     
     def _calculate_reward(self, distance_to_goal, has_collision):
-        """
-        Calculate reward based on current state.
-        
-        Args:
-            distance_to_goal: Current distance to goal
-            has_collision: Whether a collision occurred
-            
-        Returns:
-            reward: Calculated reward
-            terminated: Whether the episode is done
-        """
+        """Modified reward function with stronger goal incentives and time penalty"""
         # Check for collision
         if has_collision:
-            return -10, True
-            
-        # Check for goal reached
+            return -15, True  # Increased from -10 to -15
+                
+        # Check for goal reached - much higher reward
         at_goal = (20.0 < self.robot_pose[0] < 28.0 and 
-                  -28.0 < self.robot_pose[1] < -20.0)
+                -28.0 < self.robot_pose[1] < -20.0)
         if at_goal:
-            return 200, True
-            
+            return 1000, True
+                
         # Get minimum lidar reading
         lidar_data = self._simulate_lidar()
         min_lidar = np.min(lidar_data)
         
         # Penalty for getting too close to obstacles
-        if min_lidar < 3:
-            return -5, False
-            
-        # Reward for making progress toward the goal
+        if min_lidar < 2:
+            return -8, False  # Increased from -5 to -8
+                
+        # Base time penalty to discourage lengthy episodes
+        time_penalty = -0.2  # Small constant penalty per timestep
+        
+        # Distance-based reward component
         if distance_to_goal < self.prev_distance:
-            return 10 * max(1 - distance_to_goal / 67.22, 0), False
+            # Scaled by distance - more reward as agent gets closer to goal
+            progress_scale = 1.5 * (1 - distance_to_goal / 67.22)**2  # Quadratic scaling
+            progress_reward = 20 * progress_scale  # Increased base from 10 to 20
+            
+            # Add bonus for facing the goal - increased importance
+            angle_to_goal = np.arctan2(self.goal_position[1] - self.robot_pose[1], 
+                                    self.goal_position[0] - self.robot_pose[0])
+            heading_diff = abs(angle_to_goal - self.robot_pose[2]) % (2 * np.pi)
+            heading_diff = min(heading_diff, 2 * np.pi - heading_diff)
+            
+            # Sharper heading bonus that heavily rewards direct alignment
+            heading_bonus = 10 * (1 - (heading_diff / np.pi)**2)  # Quadratic, max 10
+            
+            # Add distance threshold bonus to encourage getting close to goal
+            distance_threshold_bonus = 0
+            if distance_to_goal < 20:  # If within 20 units of goal
+                distance_threshold_bonus = 15  # Extra incentive when getting close
+            
+            return time_penalty + progress_reward + max(0, heading_bonus) + distance_threshold_bonus, False
         else:
-            return -1, False  # Penalty for moving away from the goal
-    
+            # Larger penalty for moving away from goal
+            moving_away_penalty = -2  # Increased from -1 to -2
+            return time_penalty + moving_away_penalty, False
+            
     def _generate_random_obstacle_positions(self):
         """
         Generate random positions for obstacles.
