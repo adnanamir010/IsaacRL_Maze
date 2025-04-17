@@ -18,17 +18,17 @@ from tqdm import tqdm, trange
 
 # Initialize Isaac Sim Application
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": True})
+simulation_app = SimulationApp({"headless": False})
 
 # Import Isaac Sim modules
 import omni
 from omni.isaac.core import World
 
 # Import required modules
-from agents import SAC
+from isaac_agents import SAC
 from memory import ReplayMemory
-from environment import DDEnv
-from rl_utils import ModelStateSubscriber, LidarSubscriber, CollisionDetector, save_learning_curve, evaluate_policy
+from isaac_environment import DDEnv
+from isaac_utils import ModelStateSubscriber, LidarSubscriber, CollisionDetector, save_learning_curve, evaluate_policy
 from torch.utils.tensorboard import SummaryWriter
 import global_vars
 
@@ -202,7 +202,7 @@ def main():
     # Training loop parameters
     total_numsteps = 0
     updates = 0
-    max_episode_steps = 120
+    max_episode_steps = 220
     
     # Lists to store metrics for learning curve (using NumPy arrays for efficiency)
     episode_rewards = []

@@ -169,7 +169,7 @@ class DDEnv(Node):
         self.steering_publisher.publish(steering_angle_msg)  
 
         # Simulate for multiple steps
-        for _ in range(15):
+        for _ in range(10):
             simulation_context_ref.step(render=True)
 
         # Calculate distance to goal - optimized with numpy
@@ -196,40 +196,58 @@ class DDEnv(Node):
         return self.current_state, reward, self.done
 
     def _calculate_reward(self, distance_to_goal, clash_sum, time_steps, max_episode_steps):
-        """
-        Calculate reward based on current state.
-        """
+        """Modified reward function to match the current project's structure"""
         # Check for collision
         if clash_sum > 0:
             self.get_logger().info("COLLISION DETECTED. EPISODE ENDED.")
             self.done = True
-            return -10
-            
-        # Check for timeout
-        if time_steps >= max_episode_steps:
-            self.get_logger().info("TIME LIMIT REACHED. EPISODE ENDED.")
-            self.done = True
-            return 0
-            
-        # Check for goal reached - use boolean operations for efficiency
+            return -15 
+                
+        # Check for goal reached - much higher reward
         at_goal = (20.0 < global_vars.body_pose[0] < 28.0 and 
-                   -28.0 < global_vars.body_pose[1] < -20.0)
+                -28.0 < global_vars.body_pose[1] < -20.0)
         if at_goal:
             self.get_logger().info("GOAL REACHED. EPISODE ENDED.")
             self.done = True
-            return 20
-            
+            return 1000
+                
+        # Get minimum lidar reading
+        min_lidar = np.min(global_vars.lidar_data)
+        
         # Penalty for getting too close to obstacles
-        if np.min(global_vars.lidar_data) < 3:
+        if min_lidar < 2:
             self.get_logger().info("TOO CLOSE TO OBSTACLE.")
-            return -5
-            
-        # Reward for making progress toward the goal
+            return -8
+                
+        # Base time penalty to discourage lengthy episodes
+        time_penalty = -0.2
+        
+        # Distance-based reward component
         if distance_to_goal < self.prev_distance:
-            return 10 * max(1 - distance_to_goal / 67.22, 0)
+            # Scaled by distance - more reward as agent gets closer to goal
+            progress_scale = 1.5 * (1 - distance_to_goal / 67.22)**2  # Quadratic scaling
+            progress_reward = 20 * progress_scale  # Increased base from 10 to 20
+            
+            # Add bonus for facing the goal - increased importance
+            angle_to_goal = np.arctan2(self.goal_position[1] - global_vars.body_pose[1], 
+                                self.goal_position[0] - global_vars.body_pose[0])
+            heading_diff = abs(angle_to_goal - global_vars.body_pose[2]) % (2 * np.pi)
+            heading_diff = min(heading_diff, 2 * np.pi - heading_diff)
+            
+            # Sharper heading bonus that heavily rewards direct alignment
+            heading_bonus = 10 * (1 - (heading_diff / np.pi)**2)  # Quadratic, max 10
+            
+            # Add distance threshold bonus to encourage getting close to goal
+            distance_threshold_bonus = 0
+            if distance_to_goal < 20:  # If within 20 units of goal
+                distance_threshold_bonus = 15  # Extra incentive when getting close
+            
+            return time_penalty + progress_reward + max(0, heading_bonus) + distance_threshold_bonus
         else:
-            return -1  # Penalty for moving away from the goal
-
+            # Larger penalty for moving away from goal
+            moving_away_penalty = -2  # Increased from -1 to -2
+            return time_penalty + moving_away_penalty
+    
     def reset(self, euler_angle=None):
         """
         Reset the environment to initial state with random obstacle placement.
