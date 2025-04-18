@@ -30,11 +30,13 @@ def parse_arguments():
                         help='Matplotlib style (default: seaborn-v0_8-whitegrid)')
     parser.add_argument('--no-confidence', action='store_true',
                         help='Disable confidence intervals in plots')
+    parser.add_argument('--normalize-steps', action='store_true', default=True,
+                        help='Normalize step counts for fair comparison (default: True)')
     
     return parser.parse_args()
 
 def load_metrics(results_dir):
-    """Load metrics from JSON files."""
+    """Load metrics from JSON files and config."""
     
     # Load PPO metrics
     ppo_path = os.path.join(results_dir, 'ppo_metrics.json')
@@ -73,79 +75,120 @@ def load_metrics(results_dir):
     
     return ppo_metrics, sac_metrics, comparison_df, config
 
-def prepare_data(ppo_metrics, sac_metrics):
-    """Prepare data for analysis."""
+def prepare_data(ppo_metrics, sac_metrics, config):
+    """Prepare data for analysis, handling different step counts."""
     
     metrics_data = {}
     
+    # Determine the step counts from config if available
+    ppo_steps = config.get('ppo_num_steps', config.get('num_steps', 0)) if config else 0
+    sac_steps = config.get('num_steps', 0) if config else 0
+    
+    print(f"Step counts from config - PPO: {ppo_steps:,}, SAC: {sac_steps:,}")
+    
     # Create DataFrames for each metric type
     if ppo_metrics:
+        # Extract PPO algorithm type
+        ppo_algorithm = ppo_metrics.get('algorithm', 'PPOCLIP')
+        
         # Evaluation rewards
         ppo_eval_rewards = pd.DataFrame(ppo_metrics['eval_mean_rewards'], 
                                        columns=['steps', 'reward'])
-        ppo_eval_rewards['algorithm'] = 'PPO-CLIP'
+        ppo_eval_rewards['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
         ppo_eval_rewards['std'] = [std for _, std in ppo_metrics['eval_std_rewards']]
         
-        # Training rewards - need to potentially aggregate by step
+        # Normalize step counts if needed
+        ppo_eval_rewards['normalized_steps'] = ppo_eval_rewards['steps'] / ppo_steps
+        
+        # Training rewards
         ppo_train_rewards = pd.DataFrame(ppo_metrics['train_rewards'],
                                         columns=['steps', 'reward'])
-        ppo_train_rewards['algorithm'] = 'PPO-CLIP'
+        ppo_train_rewards['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+        ppo_train_rewards['normalized_steps'] = ppo_train_rewards['steps'] / ppo_steps
         
         # Losses
         ppo_value_losses = pd.DataFrame(ppo_metrics['value_losses'],
                                        columns=['steps', 'loss'])
         ppo_value_losses['type'] = 'value_loss'
-        ppo_value_losses['algorithm'] = 'PPO-CLIP'
+        ppo_value_losses['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+        ppo_value_losses['normalized_steps'] = ppo_value_losses['steps'] / ppo_steps
         
         ppo_policy_losses = pd.DataFrame(ppo_metrics['policy_losses'],
                                         columns=['steps', 'loss'])
         ppo_policy_losses['type'] = 'policy_loss'
-        ppo_policy_losses['algorithm'] = 'PPO-CLIP'
+        ppo_policy_losses['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+        ppo_policy_losses['normalized_steps'] = ppo_policy_losses['steps'] / ppo_steps
         
         ppo_entropy_losses = pd.DataFrame(ppo_metrics['entropy_losses'],
                                          columns=['steps', 'loss'])
         ppo_entropy_losses['type'] = 'entropy_loss'
-        ppo_entropy_losses['algorithm'] = 'PPO-CLIP'
+        ppo_entropy_losses['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+        ppo_entropy_losses['normalized_steps'] = ppo_entropy_losses['steps'] / ppo_steps
         
         # Combine losses
         ppo_losses = pd.concat([ppo_value_losses, ppo_policy_losses, ppo_entropy_losses])
+        
+        # Add algorithm-specific metrics
+        if 'clip_fractions' in ppo_metrics:
+            ppo_clip_fractions = pd.DataFrame(ppo_metrics['clip_fractions'],
+                                            columns=['steps', 'fraction'])
+            ppo_clip_fractions['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+            ppo_clip_fractions['normalized_steps'] = ppo_clip_fractions['steps'] / ppo_steps
+            metrics_data['ppo_clip_fractions'] = ppo_clip_fractions
+        
+        if 'kl_divergences' in ppo_metrics:
+            ppo_kl_divergences = pd.DataFrame(ppo_metrics['kl_divergences'],
+                                            columns=['steps', 'kl'])
+            ppo_kl_divergences['algorithm'] = f"{ppo_algorithm} ({ppo_steps:,} steps)"
+            ppo_kl_divergences['normalized_steps'] = ppo_kl_divergences['steps'] / ppo_steps
+            metrics_data['ppo_kl_divergences'] = ppo_kl_divergences
         
         metrics_data['ppo_eval_rewards'] = ppo_eval_rewards
         metrics_data['ppo_train_rewards'] = ppo_train_rewards
         metrics_data['ppo_losses'] = ppo_losses
     
     if sac_metrics:
+        # Determine SAC variants
+        critic_type = sac_metrics.get('critic_type', 'Twin')
+        entropy_type = sac_metrics.get('entropy_type', 'Adaptive')
+        
         # Evaluation rewards
         sac_eval_rewards = pd.DataFrame(sac_metrics['eval_mean_rewards'], 
                                        columns=['steps', 'reward'])
-        sac_eval_rewards['algorithm'] = 'SAC'
+        sac_eval_rewards['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
         sac_eval_rewards['std'] = [std for _, std in sac_metrics['eval_std_rewards']]
+        sac_eval_rewards['normalized_steps'] = sac_eval_rewards['steps'] / sac_steps
         
         # Training rewards
         sac_train_rewards = pd.DataFrame(sac_metrics['train_rewards'],
                                         columns=['steps', 'reward'])
-        sac_train_rewards['algorithm'] = 'SAC'
+        sac_train_rewards['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_train_rewards['normalized_steps'] = sac_train_rewards['steps'] / sac_steps
         
         # Losses
         sac_critic1_losses = pd.DataFrame(sac_metrics['critic_1_losses'],
                                          columns=['steps', 'loss'])
         sac_critic1_losses['type'] = 'critic_1_loss'
-        sac_critic1_losses['algorithm'] = 'SAC'
+        sac_critic1_losses['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_critic1_losses['normalized_steps'] = sac_critic1_losses['steps'] / sac_steps
         
         sac_critic2_losses = pd.DataFrame(sac_metrics['critic_2_losses'],
                                          columns=['steps', 'loss'])
         sac_critic2_losses['type'] = 'critic_2_loss'
-        sac_critic2_losses['algorithm'] = 'SAC'
+        sac_critic2_losses['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_critic2_losses['normalized_steps'] = sac_critic2_losses['steps'] / sac_steps
         
         sac_policy_losses = pd.DataFrame(sac_metrics['policy_losses'],
                                         columns=['steps', 'loss'])
         sac_policy_losses['type'] = 'policy_loss'
-        sac_policy_losses['algorithm'] = 'SAC'
+        sac_policy_losses['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_policy_losses['normalized_steps'] = sac_policy_losses['steps'] / sac_steps
         
         sac_alpha_losses = pd.DataFrame(sac_metrics['alpha_losses'],
                                       columns=['steps', 'loss'])
         sac_alpha_losses['type'] = 'alpha_loss'
-        sac_alpha_losses['algorithm'] = 'SAC'
+        sac_alpha_losses['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_alpha_losses['normalized_steps'] = sac_alpha_losses['steps'] / sac_steps
         
         # Combine losses
         sac_losses = pd.concat([sac_critic1_losses, sac_critic2_losses, 
@@ -154,6 +197,8 @@ def prepare_data(ppo_metrics, sac_metrics):
         # Alpha values
         sac_alphas = pd.DataFrame(sac_metrics['alphas'],
                                  columns=['steps', 'alpha'])
+        sac_alphas['algorithm'] = f"SAC {critic_type}Critic {entropy_type} ({sac_steps:,} steps)"
+        sac_alphas['normalized_steps'] = sac_alphas['steps'] / sac_steps
         
         metrics_data['sac_eval_rewards'] = sac_eval_rewards
         metrics_data['sac_train_rewards'] = sac_train_rewards
@@ -171,6 +216,13 @@ def prepare_data(ppo_metrics, sac_metrics):
                                   metrics_data['sac_train_rewards']])
         metrics_data['train_rewards'] = train_rewards
     
+    # Add the step counts to the metadata
+    metrics_data['step_info'] = {
+        'ppo_steps': ppo_steps,
+        'sac_steps': sac_steps,
+        'max_steps': max(ppo_steps, sac_steps)
+    }
+    
     return metrics_data
 
 def apply_smoothing(data, window_size=5):
@@ -178,7 +230,7 @@ def apply_smoothing(data, window_size=5):
     return data.rolling(window=window_size, min_periods=1).mean()
 
 def plot_learning_curves(metrics_data, args, output_dir):
-    """Plot learning curves comparison."""
+    """Plot learning curves comparison, handling different step counts."""
     
     # Set up plot style
     plt.style.use(args.style)
@@ -192,22 +244,34 @@ def plot_learning_curves(metrics_data, args, output_dir):
         'figure.figsize': tuple(map(float, args.figsize.split(','))),
     })
     
+    # Get step info for proper plotting
+    step_info = metrics_data.get('step_info', {})
+    ppo_steps = step_info.get('ppo_steps', 0)
+    sac_steps = step_info.get('sac_steps', 0)
+    
+    # Flag to use normalized steps for fair comparison
+    use_normalized = args.normalize_steps and ppo_steps != sac_steps and ppo_steps > 0 and sac_steps > 0
+    step_column = 'normalized_steps' if use_normalized else 'steps'
+    
     # 1. Plot evaluation rewards with confidence intervals
     if 'eval_rewards' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
         # Group by algorithm and steps
-        grouped = metrics_data['eval_rewards'].groupby(['algorithm', 'steps']).agg({
-            'reward': 'mean', 
-            'std': 'mean'
-        }).reset_index()
+        eval_rewards = metrics_data['eval_rewards']
         
-        # Apply smoothing
-        for algo in grouped['algorithm'].unique():
-            algo_data = grouped[grouped['algorithm'] == algo]
+        # Plot each algorithm's learning curve
+        for algo in eval_rewards['algorithm'].unique():
+            algo_data = eval_rewards[eval_rewards['algorithm'] == algo].copy()
             
             # Sort by steps
-            algo_data = algo_data.sort_values('steps')
+            algo_data = algo_data.sort_values(step_column)
+            
+            # Scale the x-axis based on step counts if using absolute values
+            if not use_normalized:
+                x_values = algo_data[step_column].values
+            else:
+                x_values = algo_data[step_column].values * 100  # As percentage
             
             # Apply smoothing
             if args.smoothing > 1:
@@ -218,34 +282,48 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 smoothed_stds = algo_data['std']
             
             # Plot mean
-            line = ax.plot(algo_data['steps'], smoothed_rewards, 
+            line = ax.plot(x_values, smoothed_rewards, 
                           label=algo, linewidth=2)
             
             # Add confidence interval
             if not args.no_confidence:
                 ax.fill_between(
-                    algo_data['steps'],
+                    x_values,
                     smoothed_rewards - smoothed_stds,
                     smoothed_rewards + smoothed_stds,
                     alpha=0.2,
                     color=line[0].get_color()
                 )
         
-        ax.set_xlabel('Environment Steps')
+        # Set x-axis label based on normalization
+        if use_normalized:
+            ax.set_xlabel('Training Progress (%)')
+            ax.set_xlim([0, 100])
+        else:
+            ax.set_xlabel('Environment Steps')
+        
         ax.set_ylabel('Mean Evaluation Reward')
-        ax.set_title('Evaluation Rewards Comparison')
+        if use_normalized:
+            ax.set_title('Evaluation Rewards vs Training Progress')
+        else:
+            ax.set_title('Evaluation Rewards vs Steps')
+        
         ax.legend()
         ax.grid(True, alpha=0.3)
         
         # Add annotations for maximum performance
-        for algo in grouped['algorithm'].unique():
-            algo_data = grouped[grouped['algorithm'] == algo]
+        for algo in eval_rewards['algorithm'].unique():
+            algo_data = eval_rewards[eval_rewards['algorithm'] == algo]
             max_idx = algo_data['reward'].idxmax()
-            max_step = algo_data.loc[max_idx, 'steps']
+            if use_normalized:
+                max_x = algo_data.loc[max_idx, step_column] * 100  # As percentage
+            else:
+                max_x = algo_data.loc[max_idx, step_column]
             max_reward = algo_data.loc[max_idx, 'reward']
             
+            # Add annotation with an arrow
             ax.annotate(f'Max: {max_reward:.2f}',
-                      xy=(max_step, max_reward),
+                      xy=(max_x, max_reward),
                       xytext=(10, 10),
                       textcoords='offset points',
                       arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'))
@@ -262,12 +340,16 @@ def plot_learning_curves(metrics_data, args, output_dir):
         # For training rewards, we'll aggregate by step bins to make the plot cleaner
         train_rewards = metrics_data['train_rewards'].copy()
         
-        # Determine bin size based on total steps
-        max_steps = train_rewards['steps'].max()
-        bin_size = max(1, max_steps // 100)  # About 100 points on the x-axis
-        
-        # Create step bins
-        train_rewards['step_bin'] = (train_rewards['steps'] // bin_size) * bin_size
+        # Determine bin size based on step normalization
+        if use_normalized:
+            # Use percentage bins
+            bin_size = 0.01  # 1% increments
+            train_rewards['step_bin'] = (train_rewards[step_column] // bin_size) * bin_size
+        else:
+            # Determine bin size based on total steps
+            max_steps = max(train_rewards['steps'])
+            bin_size = max(1, max_steps // 100)  # About 100 points on the x-axis
+            train_rewards['step_bin'] = (train_rewards['steps'] // bin_size) * bin_size
         
         # Group by algorithm and step bin
         grouped = train_rewards.groupby(['algorithm', 'step_bin']).agg({
@@ -284,6 +366,12 @@ def plot_learning_curves(metrics_data, args, output_dir):
             # Sort by step bin
             algo_data = algo_data.sort_values('step_bin')
             
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = algo_data['step_bin'] * 100  # As percentage
+            else:
+                x_values = algo_data['step_bin']
+            
             # Apply smoothing
             if args.smoothing > 1:
                 smoothed_rewards = apply_smoothing(algo_data['reward_mean'], args.smoothing)
@@ -296,22 +384,32 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 smoothed_stds = algo_data['reward_std'] if 'reward_std' in algo_data.columns else None
             
             # Plot mean
-            line = ax.plot(algo_data['step_bin'], smoothed_rewards, 
+            line = ax.plot(x_values, smoothed_rewards, 
                           label=algo, linewidth=2, alpha=0.8)
             
             # Add confidence interval
             if not args.no_confidence and smoothed_stds is not None:
                 ax.fill_between(
-                    algo_data['step_bin'],
+                    x_values,
                     smoothed_rewards - smoothed_stds,
                     smoothed_rewards + smoothed_stds,
                     alpha=0.1,
                     color=line[0].get_color()
                 )
         
-        ax.set_xlabel('Environment Steps')
+        # Set x-axis label based on normalization
+        if use_normalized:
+            ax.set_xlabel('Training Progress (%)')
+            ax.set_xlim([0, 100])
+        else:
+            ax.set_xlabel('Environment Steps')
+        
         ax.set_ylabel('Mean Training Episode Reward')
-        ax.set_title('Training Rewards Comparison')
+        if use_normalized:
+            ax.set_title('Training Rewards vs Progress')
+        else:
+            ax.set_title('Training Rewards vs Steps')
+        
         ax.legend()
         ax.grid(True, alpha=0.3)
         
@@ -321,16 +419,22 @@ def plot_learning_curves(metrics_data, args, output_dir):
         plt.close()
     
     # 3. Plot loss curves for each algorithm
-    # PPO Losses
+    # 3a. PPO Losses
     if 'ppo_losses' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
         ppo_losses = metrics_data['ppo_losses'].copy()
         
         # Bin losses by steps
-        max_steps = ppo_losses['steps'].max()
-        bin_size = max(1, max_steps // 100)
-        ppo_losses['step_bin'] = (ppo_losses['steps'] // bin_size) * bin_size
+        if use_normalized:
+            bin_size = 0.01  # 1% increments
+            ppo_losses['step_bin'] = (ppo_losses[step_column] // bin_size) * bin_size
+            x_label = 'Training Progress (%)'
+        else:
+            max_steps = max(ppo_losses['steps'])
+            bin_size = max(1, max_steps // 100)
+            ppo_losses['step_bin'] = (ppo_losses['steps'] // bin_size) * bin_size
+            x_label = 'Environment Steps'
         
         # Group by loss type and step bin
         grouped = ppo_losses.groupby(['type', 'step_bin']).agg({
@@ -344,6 +448,12 @@ def plot_learning_curves(metrics_data, args, output_dir):
             # Sort by step bin
             type_data = type_data.sort_values('step_bin')
             
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = type_data['step_bin'] * 100  # As percentage
+            else:
+                x_values = type_data['step_bin']
+            
             # Apply smoothing
             if args.smoothing > 1:
                 smoothed_losses = apply_smoothing(type_data['loss'], args.smoothing)
@@ -356,33 +466,43 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 scale_factor = max(1, abs(grouped[grouped['type'] != 'entropy_loss']['loss'].median() /
                                       type_data['loss'].median()))
                 scaled_losses = smoothed_losses * scale_factor
-                ax.plot(type_data['step_bin'], scaled_losses, 
+                ax.plot(x_values, scaled_losses, 
                        label=f'{loss_type} (scaled)', linewidth=2)
             else:
-                ax.plot(type_data['step_bin'], smoothed_losses, 
+                ax.plot(x_values, smoothed_losses, 
                        label=loss_type, linewidth=2)
         
-        ax.set_xlabel('Environment Steps')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Loss')
         ax.set_title('PPO Loss Components')
         ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        # Set x-axis limit for normalized steps
+        if use_normalized:
+            ax.set_xlim([0, 100])
         
         # Save figure
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'ppo_losses.png'))
         plt.close()
     
-    # SAC Losses
+    # 3b. SAC Losses
     if 'sac_losses' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
         sac_losses = metrics_data['sac_losses'].copy()
         
         # Bin losses by steps
-        max_steps = sac_losses['steps'].max()
-        bin_size = max(1, max_steps // 100)
-        sac_losses['step_bin'] = (sac_losses['steps'] // bin_size) * bin_size
+        if use_normalized:
+            bin_size = 0.01  # 1% increments
+            sac_losses['step_bin'] = (sac_losses[step_column] // bin_size) * bin_size
+            x_label = 'Training Progress (%)'
+        else:
+            max_steps = max(sac_losses['steps'])
+            bin_size = max(1, max_steps // 100)
+            sac_losses['step_bin'] = (sac_losses['steps'] // bin_size) * bin_size
+            x_label = 'Environment Steps'
         
         # Group by loss type and step bin
         grouped = sac_losses.groupby(['type', 'step_bin']).agg({
@@ -396,6 +516,12 @@ def plot_learning_curves(metrics_data, args, output_dir):
             # Sort by step bin
             type_data = type_data.sort_values('step_bin')
             
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = type_data['step_bin'] * 100  # As percentage
+            else:
+                x_values = type_data['step_bin']
+            
             # Apply smoothing
             if args.smoothing > 1:
                 smoothed_losses = apply_smoothing(type_data['loss'], args.smoothing)
@@ -403,14 +529,18 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 smoothed_losses = type_data['loss']
             
             # Plot
-            ax.plot(type_data['step_bin'], smoothed_losses, 
+            ax.plot(x_values, smoothed_losses, 
                    label=loss_type, linewidth=2)
         
-        ax.set_xlabel('Environment Steps')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Loss')
         ax.set_title('SAC Loss Components')
         ax.legend()
         ax.grid(True, alpha=0.3)
+        
+        # Set x-axis limit for normalized steps
+        if use_normalized:
+            ax.set_xlim([0, 100])
         
         # Save figure
         plt.tight_layout()
@@ -424,7 +554,15 @@ def plot_learning_curves(metrics_data, args, output_dir):
         sac_alphas = metrics_data['sac_alphas'].copy()
         
         # Sort by steps
-        sac_alphas = sac_alphas.sort_values('steps')
+        sac_alphas = sac_alphas.sort_values(step_column)
+        
+        # Scale x-axis for normalized steps
+        if use_normalized:
+            x_values = sac_alphas[step_column] * 100  # As percentage
+            x_label = 'Training Progress (%)'
+        else:
+            x_values = sac_alphas['steps']
+            x_label = 'Environment Steps'
         
         # Apply smoothing
         if args.smoothing > 1:
@@ -433,13 +571,17 @@ def plot_learning_curves(metrics_data, args, output_dir):
             smoothed_alphas = sac_alphas['alpha']
         
         # Plot
-        ax.plot(sac_alphas['steps'], smoothed_alphas, 
+        ax.plot(x_values, smoothed_alphas, 
                label='alpha', linewidth=2)
         
-        ax.set_xlabel('Environment Steps')
+        ax.set_xlabel(x_label)
         ax.set_ylabel('Alpha Value')
         ax.set_title('SAC Temperature Parameter (Alpha)')
         ax.grid(True, alpha=0.3)
+        
+        # Set x-axis limit for normalized steps
+        if use_normalized:
+            ax.set_xlim([0, 100])
         
         # Save figure
         plt.tight_layout()
@@ -498,12 +640,15 @@ def plot_learning_curves(metrics_data, args, output_dir):
         ax.set_title('Final Performance Comparison')
         ax.grid(True, alpha=0.3, axis='y')
         
-        # Save figure
+        # Adjust figure for long algorithm names
+        plt.xticks(rotation=15, ha='right')
         plt.tight_layout()
+        
+        # Save figure
         plt.savefig(os.path.join(output_dir, 'final_performance.png'))
         plt.close()
     
-    # 6. Learning progress visualization
+    # 6. Learning progress visualization (normalized to percentage)
     if 'eval_rewards' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
@@ -517,7 +662,13 @@ def plot_learning_curves(metrics_data, args, output_dir):
             algo_data = eval_rewards[eval_rewards['algorithm'] == algo]
             
             # Sort by steps
-            algo_data = algo_data.sort_values('steps')
+            algo_data = algo_data.sort_values(step_column)
+            
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = algo_data[step_column] * 100  # As percentage
+            else:
+                x_values = algo_data[step_column]
             
             # Calculate percentage of max reward
             algo_data['progress'] = algo_data['reward'] / max_reward * 100
@@ -529,10 +680,16 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 smoothed_progress = algo_data['progress']
             
             # Plot
-            ax.plot(algo_data['steps'], smoothed_progress, 
+            ax.plot(x_values, smoothed_progress, 
                    label=algo, linewidth=2)
         
-        ax.set_xlabel('Environment Steps')
+        # Set x-axis label based on normalization
+        if use_normalized:
+            ax.set_xlabel('Training Progress (%)')
+            ax.set_xlim([0, 100])
+        else:
+            ax.set_xlabel('Environment Steps')
+        
         ax.set_ylabel('Percentage of Maximum Reward')
         ax.set_title('Learning Progress')
         ax.legend()
@@ -549,7 +706,7 @@ def plot_learning_curves(metrics_data, args, output_dir):
         plt.savefig(os.path.join(output_dir, 'learning_progress.png'))
         plt.close()
     
-    # 7. Sample efficiency comparison
+    # 7. Normalized sample efficiency comparison
     if 'eval_rewards' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
@@ -575,7 +732,12 @@ def plot_learning_curves(metrics_data, args, output_dir):
                 if not above_threshold.empty:
                     # Get the steps at which it first exceeded the threshold
                     first_crossing = above_threshold.iloc[0]
-                    steps_to_threshold[algo].append((threshold, first_crossing['steps']))
+                    
+                    # Use normalized or absolute step count
+                    if use_normalized:
+                        steps_to_threshold[algo].append((threshold, first_crossing[step_column] * 100))  # As percentage
+                    else:
+                        steps_to_threshold[algo].append((threshold, first_crossing['steps']))
                 else:
                     # Algorithm never reached this threshold
                     steps_to_threshold[algo].append((threshold, np.nan))
@@ -598,18 +760,30 @@ def plot_learning_curves(metrics_data, args, output_dir):
             for bar, value in zip(bars, values):
                 if not np.isnan(value):
                     height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2, height,
-                           f"{int(value):,}",
-                           ha='center', va='bottom',
-                           rotation=45, fontsize=args.font_size-2)
+                    if use_normalized:
+                        # Show as percentage
+                        ax.text(bar.get_x() + bar.get_width()/2, height,
+                               f"{value:.1f}%",
+                               ha='center', va='bottom',
+                               rotation=45, fontsize=args.font_size-2)
+                    else:
+                        # Format as number with commas
+                        ax.text(bar.get_x() + bar.get_width()/2, height,
+                               f"{int(value):,}",
+                               ha='center', va='bottom',
+                               rotation=45, fontsize=args.font_size-2)
         
         # Set x-axis labels and ticks
         ax.set_xticks(x)
         ax.set_xticklabels([f"{int(t*100)}%" for t in thresholds])
         
-        ax.set_xlabel('Performance Threshold (% of max reward)')
-        ax.set_ylabel('Steps to Reach Threshold')
-        ax.set_title('Sample Efficiency Comparison')
+        if use_normalized:
+            ax.set_ylabel('Training Progress to Reach Threshold (%)')
+            ax.set_title('Sample Efficiency Comparison (Normalized)')
+        else:
+            ax.set_ylabel('Steps to Reach Threshold')
+            ax.set_title('Sample Efficiency Comparison')
+            
         ax.legend()
         ax.grid(True, alpha=0.3)
         
@@ -618,97 +792,258 @@ def plot_learning_curves(metrics_data, args, output_dir):
         plt.savefig(os.path.join(output_dir, 'sample_efficiency.png'))
         plt.close()
     
-    # 8. Performance stability analysis
-    if 'eval_rewards' in metrics_data:
+    # 8. PPO-specific plots
+    # 8a. Clip fractions (for PPOCLIP)
+    if 'ppo_clip_fractions' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
-        eval_rewards = metrics_data['eval_rewards'].copy()
+        clip_data = metrics_data['ppo_clip_fractions'].copy()
+        clip_data = clip_data.sort_values(step_column)
         
-        # Calculate moving average and standard deviation for stability analysis
-        window_size = max(5, int(len(eval_rewards) / 10))  # Dynamic window size
+        # Scale x-axis for normalized steps
+        if use_normalized:
+            x_values = clip_data[step_column] * 100  # As percentage
+            x_label = 'Training Progress (%)'
+        else:
+            x_values = clip_data['steps']
+            x_label = 'Environment Steps'
         
-        for algo in eval_rewards['algorithm'].unique():
-            algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
-            
-            # Calculate rolling metrics
-            if len(algo_data) > window_size:
-                rolling_mean = algo_data['reward'].rolling(window=window_size, min_periods=1).mean()
-                rolling_std = algo_data['reward'].rolling(window=window_size, min_periods=1).std()
-                
-                # Calculate coefficient of variation (CV = std/mean) as stability metric
-                # Higher CV = more variability = less stable
-                cv = rolling_std / rolling_mean
-                
-                # Plot stability metric
-                ax.plot(algo_data['steps'], cv, 
-                       label=f"{algo} Variability", linewidth=2)
+        # Apply smoothing
+        if args.smoothing > 1:
+            smoothed_clip = apply_smoothing(clip_data['fraction'], args.smoothing)
+        else:
+            smoothed_clip = clip_data['fraction']
         
-        ax.set_xlabel('Environment Steps')
-        ax.set_ylabel('Coefficient of Variation (Lower = More Stable)')
-        ax.set_title('Learning Stability Analysis')
+        # Plot
+        ax.plot(x_values, smoothed_clip, 'b-', linewidth=2, label='Clip Fraction')
+        
+        # Add reference lines
+        ax.axhline(y=0.1, color='r', linestyle='--', alpha=0.5, label='10% Threshold')
+        ax.axhline(y=0.2, color='orange', linestyle='-.', alpha=0.5, label='20% Threshold')
+        
+        ax.set_xlabel(x_label)
+        ax.set_ylabel('Clip Fraction')
+        ax.set_title('PPO Clip Fraction')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
+        # Set x-axis limit for normalized steps
+        if use_normalized:
+            ax.set_xlim([0, 100])
+        
         # Save figure
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'stability_analysis.png'))
+        plt.savefig(os.path.join(output_dir, 'ppo_clip_fraction.png'))
         plt.close()
-
-    # 9. Training efficiency comparison
-    if ppo_metrics and sac_metrics and 'times' in ppo_metrics and 'times' in sac_metrics:
+    
+    # 8b. KL divergences (for PPOKL)
+    if 'ppo_kl_divergences' in metrics_data:
         fig, ax = plt.subplots(dpi=args.dpi)
         
-        # Extract timing data
-        ppo_steps = np.array(ppo_metrics['steps'])
-        ppo_times = np.array(ppo_metrics['times'])
+        kl_data = metrics_data['ppo_kl_divergences'].copy()
+        kl_data = kl_data.sort_values(step_column)
         
-        sac_steps = np.array(sac_metrics['steps'])
-        sac_times = np.array(sac_metrics['times'])
+        # Scale x-axis for normalized steps
+        if use_normalized:
+            x_values = kl_data[step_column] * 100  # As percentage
+            x_label = 'Training Progress (%)'
+        else:
+            x_values = kl_data['steps']
+            x_label = 'Environment Steps'
         
-        # Calculate steps per second
-        ppo_steps_per_sec = ppo_steps / ppo_times
-        sac_steps_per_sec = sac_steps / sac_times
+        # Apply smoothing
+        if args.smoothing > 1:
+            smoothed_kl = apply_smoothing(kl_data['kl'], args.smoothing)
+        else:
+            smoothed_kl = kl_data['kl']
         
-        # Create DataFrame for plotting
-        efficiency_data = pd.DataFrame({
-            'Algorithm': ['PPO-CLIP'] * len(ppo_steps) + ['SAC'] * len(sac_steps),
-            'Step': list(ppo_steps) + list(sac_steps),
-            'Time': list(ppo_times) + list(sac_times),
-            'Steps/Second': list(ppo_steps_per_sec) + list(sac_steps_per_sec)
-        })
+        # Plot
+        ax.plot(x_values, smoothed_kl, 'b-', linewidth=2, label='KL Divergence')
         
-        # Plot as violin plot
-        sns.violinplot(x='Algorithm', y='Steps/Second', data=efficiency_data, ax=ax)
+        # Add target KL reference line if in config
+        if 'config' in locals() and config and 'kl_target' in config:
+            kl_target = config['kl_target']
+            ax.axhline(y=kl_target, color='r', linestyle='--', alpha=0.7, 
+                      label=f'Target KL: {kl_target}')
         
-        # Add individual points
-        sns.stripplot(x='Algorithm', y='Steps/Second', data=efficiency_data, 
-                     color='black', size=3, jitter=True, alpha=0.3, ax=ax)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel('KL Divergence')
+        ax.set_title('PPO KL Divergence')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
         
-        # Add average values as text
-        for i, algo in enumerate(['PPO-CLIP', 'SAC']):
-            avg_speed = efficiency_data[efficiency_data['Algorithm'] == algo]['Steps/Second'].mean()
-            ax.text(i, efficiency_data['Steps/Second'].max() * 0.9, 
-                   f"Avg: {avg_speed:.1f}\nsteps/sec", 
-                   ha='center', va='center',
-                   bbox=dict(facecolor='white', alpha=0.7))
+        # Set x-axis limit for normalized steps
+        if use_normalized:
+            ax.set_xlim([0, 100])
         
-        ax.set_ylabel('Environment Steps per Second')
-        ax.set_title('Training Efficiency Comparison')
-        ax.grid(True, alpha=0.3, axis='y')
+        # Use log scale for KL values
+        if np.max(smoothed_kl) / np.min(smoothed_kl) > 100:
+            ax.set_yscale('log')
         
         # Save figure
         plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'training_efficiency.png'))
+        plt.savefig(os.path.join(output_dir, 'ppo_kl_divergence.png'))
         plt.close()
+    
+    # 9. Create comparison dashboard
+    # This is a summary figure showing the most important metrics side by side
+    fig = plt.figure(figsize=(15, 10), dpi=args.dpi)
+    
+    # 9a. Evaluation rewards
+    if 'eval_rewards' in metrics_data:
+        ax1 = fig.add_subplot(221)
+        
+        for algo in metrics_data['eval_rewards']['algorithm'].unique():
+            algo_data = metrics_data['eval_rewards'][metrics_data['eval_rewards']['algorithm'] == algo].copy()
+            algo_data = algo_data.sort_values(step_column)
+            
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = algo_data[step_column] * 100  # As percentage
+            else:
+                x_values = algo_data[step_column]
+            
+            # Apply smoothing
+            if args.smoothing > 1:
+                smoothed_rewards = apply_smoothing(algo_data['reward'], args.smoothing)
+            else:
+                smoothed_rewards = algo_data['reward']
+            
+            ax1.plot(x_values, smoothed_rewards, 
+                    label=algo, linewidth=2)
+        
+        if use_normalized:
+            ax1.set_xlabel('Training Progress (%)')
+            ax1.set_xlim([0, 100])
+        else:
+            ax1.set_xlabel('Environment Steps')
+        
+        ax1.set_ylabel('Mean Evaluation Reward')
+        ax1.set_title('Evaluation Performance')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+    
+    # 9b. Sample efficiency
+    if 'eval_rewards' in metrics_data:
+        ax2 = fig.add_subplot(222)
+        
+        # Use the sample efficiency calculations from before
+        width = 0.35
+        x = np.arange(len(thresholds))
+        
+        for i, algo in enumerate(steps_to_threshold.keys()):
+            values = [steps for _, steps in steps_to_threshold[algo]]
+            ax2.bar(x + i*width - width/2, values, width, 
+                   label=algo, color=colors[i], alpha=0.7)
+        
+        ax2.set_xticks(x)
+        ax2.set_xticklabels([f"{int(t*100)}%" for t in thresholds])
+        
+        if use_normalized:
+            ax2.set_ylabel('Training Progress (%)')
+        else:
+            ax2.set_ylabel('Steps to Reach Threshold')
+            
+        ax2.set_title('Sample Efficiency')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3, axis='y')
+    
+    # 9c. Final performance
+    if 'eval_rewards' in metrics_data:
+        ax3 = fig.add_subplot(223)
+        
+        # Use the final rewards calculated earlier
+        ax3.bar(
+            final_df['algorithm'],
+            final_df['reward'],
+            yerr=final_df['std'],
+            capsize=10,
+            color=['blue', 'red'],
+            alpha=0.7
+        )
+        
+        ax3.set_ylabel('Final Mean Reward')
+        ax3.set_title('Final Performance')
+        ax3.grid(True, alpha=0.3, axis='y')
+        plt.setp(ax3.get_xticklabels(), rotation=15, ha='right')
+    
+    # 9d. Learning progress (normalized)
+    if 'eval_rewards' in metrics_data:
+        ax4 = fig.add_subplot(224)
+        
+        for algo in eval_rewards['algorithm'].unique():
+            algo_data = eval_rewards[eval_rewards['algorithm'] == algo].copy()
+            algo_data = algo_data.sort_values(step_column)
+            
+            # Scale x-axis for normalized steps
+            if use_normalized:
+                x_values = algo_data[step_column] * 100  # As percentage
+            else:
+                x_values = algo_data[step_column]
+            
+            # Calculate percentage of max reward
+            algo_data['progress'] = algo_data['reward'] / max_reward * 100
+            
+            # Apply smoothing
+            if args.smoothing > 1:
+                smoothed_progress = apply_smoothing(algo_data['progress'], args.smoothing)
+            else:
+                smoothed_progress = algo_data['progress']
+            
+            ax4.plot(x_values, smoothed_progress, 
+                    label=algo, linewidth=2)
+        
+        if use_normalized:
+            ax4.set_xlabel('Training Progress (%)')
+            ax4.set_xlim([0, 100])
+        else:
+            ax4.set_xlabel('Environment Steps')
+            
+        ax4.set_ylabel('% of Maximum Reward')
+        ax4.set_title('Learning Progress')
+        ax4.grid(True, alpha=0.3)
+        
+        # Add 50% and 75% reference lines
+        for pct in [50, 75]:
+            ax4.axhline(y=pct, color='gray', linestyle='--', alpha=0.5)
+            ax4.text(ax4.get_xlim()[1] * 0.02, pct + 2, f"{pct}%", 
+                    color='gray', alpha=0.7)
+    
+    # Main title explaining the comparison
+    if use_normalized:
+        fig.suptitle(f'PPO vs SAC Comparison (Normalized by Training Progress)', fontsize=16)
+    else:
+        fig.suptitle(f'PPO ({ppo_steps:,} steps) vs SAC ({sac_steps:,} steps) Comparison', fontsize=16)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, 'algorithm_comparison_dashboard.png'))
+    plt.close()
 
-def generate_statistical_analysis(metrics_data, output_dir):
+def generate_statistical_analysis(metrics_data, config, output_dir):
     """Generate statistical analysis of the results."""
     
     # Create a text file to store the analysis
     stats_file = os.path.join(output_dir, 'statistical_analysis.txt')
     
+    # Get step info
+    step_info = metrics_data.get('step_info', {})
+    ppo_steps = step_info.get('ppo_steps', 0)
+    sac_steps = step_info.get('sac_steps', 0)
+    
     with open(stats_file, 'w') as f:
         f.write("# Statistical Analysis of Algorithm Performance\n\n")
+        
+        # Write step information
+        f.write("## Training Configuration\n\n")
+        if ppo_steps > 0:
+            f.write(f"- PPO trained for {ppo_steps:,} steps\n")
+        if sac_steps > 0:
+            f.write(f"- SAC trained for {sac_steps:,} steps\n")
+            
+        # Note about different step counts
+        if ppo_steps != sac_steps and ppo_steps > 0 and sac_steps > 0:
+            f.write(f"\n**Note:** PPO trained for {ppo_steps/sac_steps:.1f}x more steps than SAC. ")
+            f.write("This analysis considers this difference.\n\n")
         
         if 'eval_rewards' in metrics_data:
             f.write("## Evaluation Rewards Analysis\n\n")
@@ -720,6 +1055,16 @@ def generate_statistical_analysis(metrics_data, output_dir):
             for algo in algorithms:
                 algo_data = metrics_data['eval_rewards'][metrics_data['eval_rewards']['algorithm'] == algo]
                 rewards_by_algo[algo] = algo_data['reward'].values
+                
+                # Also calculate progress-normalized metrics if step counts differ
+                if ppo_steps != sac_steps and ppo_steps > 0 and sac_steps > 0:
+                    # Get normalized data
+                    algo_data_norm = algo_data.copy()
+                    normalized_steps = algo_data_norm['normalized_steps'] * 100  # As percentage
+                    
+                    # Store for later analysis
+                    rewards_by_algo[f"{algo}_normalized"] = algo_data_norm['reward'].values
+                    rewards_by_algo[f"{algo}_progress"] = normalized_steps
             
             # Basic statistics for each algorithm
             f.write("### Basic Statistics\n\n")
@@ -727,6 +1072,9 @@ def generate_statistical_analysis(metrics_data, output_dir):
             f.write("|-----------|------|--------|---------|-----|-----|-------|\n")
             
             for algo, rewards in rewards_by_algo.items():
+                if "_normalized" in algo or "_progress" in algo:
+                    continue  # Skip normalized data in this table
+                
                 last_reward = rewards[-1]
                 f.write(f"| {algo} | {np.mean(rewards):.2f} | {np.median(rewards):.2f} | "
                        f"{np.std(rewards):.2f} | {np.min(rewards):.2f} | {np.max(rewards):.2f} | "
@@ -737,6 +1085,42 @@ def generate_statistical_analysis(metrics_data, output_dir):
             # Comparative statistics if we have multiple algorithms
             if len(algorithms) > 1:
                 f.write("### Comparative Analysis\n\n")
+                
+                # Progress-normalized metrics if step counts differ
+                if ppo_steps != sac_steps and ppo_steps > 0 and sac_steps > 0:
+                    f.write("#### Training Progress Comparison\n\n")
+                    f.write("Since PPO and SAC were trained for different numbers of steps, it's important to compare them at equivalent points in their training progress.\n\n")
+                    
+                    # Compare at 25%, 50%, 75%, and 100% of training
+                    progress_points = [25, 50, 75, 100]
+                    
+                    f.write("| Progress | ")
+                    for algo in algorithms:
+                        f.write(f"{algo} | ")
+                    f.write("\n")
+                    
+                    f.write("|----------|")
+                    for _ in algorithms:
+                        f.write("-----------|")
+                    f.write("\n")
+                    
+                    for progress in progress_points:
+                        f.write(f"| {progress}% | ")
+                        
+                        for algo in algorithms:
+                            # Find the reward at this progress point
+                            algo_progress = rewards_by_algo[f"{algo}_progress"]
+                            algo_rewards = rewards_by_algo[f"{algo}_normalized"]
+                            
+                            # Find closest progress point
+                            closest_idx = np.argmin(np.abs(algo_progress - progress))
+                            reward_at_progress = algo_rewards[closest_idx]
+                            
+                            f.write(f"{reward_at_progress:.2f} | ")
+                        
+                        f.write("\n")
+                    
+                    f.write("\n")
                 
                 # Perform statistical tests
                 f.write("#### Statistical Significance Tests\n\n")
@@ -802,7 +1186,8 @@ def generate_statistical_analysis(metrics_data, output_dir):
                 f.write("#### Performance Improvement Analysis\n\n")
                 
                 # Find best performing algorithm
-                avg_rewards = {algo: np.mean(rewards) for algo, rewards in rewards_by_algo.items()}
+                avg_rewards = {algo: np.mean(rewards) for algo, rewards in rewards_by_algo.items() 
+                              if "_normalized" not in algo and "_progress" not in algo}
                 best_algo = max(avg_rewards, key=avg_rewards.get)
                 
                 f.write(f"Best performing algorithm (by mean reward): **{best_algo}**\n\n")
@@ -816,6 +1201,25 @@ def generate_statistical_analysis(metrics_data, output_dir):
                 for algo, mean_reward in sorted(avg_rewards.items(), key=lambda x: x[1], reverse=True):
                     pct_of_best = (mean_reward / best_mean) * 100
                     f.write(f"| {algo} | {mean_reward:.2f} | {pct_of_best:.1f}% |\n")
+                
+                f.write("\n")
+                
+                # Final performance comparison
+                f.write("#### Final Performance Comparison\n\n")
+                
+                final_rewards = {}
+                for algo, rewards in rewards_by_algo.items():
+                    if "_normalized" not in algo and "_progress" not in algo:
+                        final_rewards[algo] = rewards[-1]
+                
+                best_final = max(final_rewards.values())
+                
+                f.write("| Algorithm | Final Reward | % of Best |\n")
+                f.write("|-----------|-------------|----------|\n")
+                
+                for algo, reward in sorted(final_rewards.items(), key=lambda x: x[1], reverse=True):
+                    pct_of_best = (reward / best_final) * 100
+                    f.write(f"| {algo} | {reward:.2f} | {pct_of_best:.1f}% |\n")
                 
                 f.write("\n")
         
@@ -834,71 +1238,26 @@ def generate_statistical_analysis(metrics_data, output_dir):
             
             f.write("### Steps to Reach Performance Thresholds\n\n")
             
-            f.write("| Algorithm |")
-            for t in thresholds:
-                f.write(f" {int(t*100)}% of Max |")
-            f.write("\n")
-            
-            f.write("|-----------|")
-            for _ in thresholds:
-                f.write("-------------|")
-            f.write("\n")
-            
-            # Calculate steps needed for each algorithm to reach thresholds
-            for algo in eval_rewards['algorithm'].unique():
-                algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
+            # Analyze both in raw steps and normalized progress
+            for metric_type, header in [("steps", "Raw Steps"), ("normalized_steps", "Training Progress")]:
+                if metric_type == "normalized_steps" and (ppo_steps == 0 or sac_steps == 0 or ppo_steps == sac_steps):
+                    continue  # Skip normalized analysis if step counts are the same
                 
-                f.write(f"| {algo} |")
+                f.write(f"#### {header}\n\n")
                 
-                for threshold_value in threshold_values:
-                    above_threshold = algo_data[algo_data['reward'] >= threshold_value]
-                    
-                    if not above_threshold.empty:
-                        first_crossing = above_threshold.iloc[0]
-                        f.write(f" {int(first_crossing['steps']):,} |")
-                    else:
-                        f.write(" Never |")
-                
+                f.write("| Algorithm |")
+                for t in thresholds:
+                    f.write(f" {int(t*100)}% of Max |")
                 f.write("\n")
-            
-            f.write("\n")
-            
-            # Add interpretation
-            f.write("### Interpretation\n\n")
-            f.write("Sample efficiency refers to how quickly an algorithm learns from experience. ")
-            f.write("An algorithm is more sample efficient if it reaches performance thresholds ")
-            f.write("with fewer environment interactions (steps).\n\n")
-            
-            # Try to identify which algorithm is more sample efficient
-            if len(eval_rewards['algorithm'].unique()) > 1:
-                # Compare sample efficiency at the middle threshold (50%)
-                mid_threshold = threshold_values[1]  # 50% threshold
                 
-                steps_to_mid = {}
+                f.write("|-----------|")
+                for _ in thresholds:
+                    f.write("-------------|")
+                f.write("\n")
+                
+                # Calculate steps needed for each algorithm to reach thresholds
                 for algo in eval_rewards['algorithm'].unique():
                     algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
-                    above_threshold = algo_data[algo_data['reward'] >= mid_threshold]
-                    
-                    if not above_threshold.empty:
-                        steps_to_mid[algo] = above_threshold.iloc[0]['steps']
-                
-                if len(steps_to_mid) > 1:
-                    most_efficient = min(steps_to_mid, key=steps_to_mid.get)
-                    f.write(f"Based on the steps needed to reach 50% of maximum performance, ")
-                    f.write(f"**{most_efficient}** appears to be more sample efficient.\n\n")
-        
-        # Training stability analysis
-        if 'eval_rewards' in metrics_data:
-            f.write("## Training Stability Analysis\n\n")
-            
-            eval_rewards = metrics_data['eval_rewards'].copy()
-            
-            # Calculate coefficient of variation for each algorithm
-            f.write("| Algorithm | CV (Full Training) | CV (Last Half) |\n")
-            f.write("|-----------|---------------------|----------------|\n")
-            
-            for algo in eval_rewards['algorithm'].unique():
-                algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
                 
                 # Calculate CV for full training
                 mean_reward = algo_data['reward'].mean()
@@ -917,6 +1276,259 @@ def generate_statistical_analysis(metrics_data, output_dir):
             
             f.write("\n")
             f.write("*Note: Lower Coefficient of Variation (CV) indicates more stable training.*\n\n")
+            
+            # Add extra stability metrics considering the different step counts
+            if ppo_steps != sac_steps and ppo_steps > 0 and sac_steps > 0:
+                f.write("### Stability During Equivalent Training Phases\n\n")
+                f.write("To fairly compare stability between algorithms with different training durations, ")
+                f.write("we analyze the Coefficient of Variation during equivalent normalized training phases.\n\n")
+                
+                # Calculate CV for various training phases (0-25%, 25-50%, 50-75%, 75-100%)
+                training_phases = [(0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)]
+                phase_names = ["Start (0-25%)", "Early (25-50%)", "Mid (50-75%)", "Late (75-100%)"]
+                
+                f.write("| Algorithm |")
+                for phase in phase_names:
+                    f.write(f" {phase} |")
+                f.write("\n")
+                
+                f.write("|-----------|")
+                for _ in phase_names:
+                    f.write("-----------|")
+                f.write("\n")
+                
+                for algo in eval_rewards['algorithm'].unique():
+                    algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('normalized_steps')
+                    
+                    f.write(f"| {algo} |")
+                    
+                    for start, end in training_phases:
+                        # Get data for this phase
+                        phase_data = algo_data[(algo_data['normalized_steps'] >= start) & 
+                                             (algo_data['normalized_steps'] < end)]
+                        
+                        if len(phase_data) > 1:
+                            mean_phase = phase_data['reward'].mean()
+                            std_phase = phase_data['reward'].std()
+                            cv_phase = (std_phase / mean_phase) if mean_phase != 0 else float('inf')
+                            f.write(f" {cv_phase:.4f} |")
+                        else:
+                            f.write(" N/A |")
+                    
+                    f.write("\n")
+                
+                f.write("\n")
+                
+                f.write("### Stability Analysis Interpretation\n\n")
+                f.write("- Training stability is critical for reliable and predictable learning in RL algorithms.\n")
+                f.write("- Lower CV indicates less variance relative to the mean reward, suggesting more stable training.\n")
+                f.write("- Typically, we expect stability to improve in later phases of training as policies converge.\n")
+                
+                # Attempt to identify more stable algorithm
+                cv_by_algo = {}
+                for algo in eval_rewards['algorithm'].unique():
+                    algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
+                    mean_reward = algo_data['reward'].mean()
+                    std_reward = algo_data['reward'].std()
+                    cv_by_algo[algo] = (std_reward / mean_reward) if mean_reward != 0 else float('inf')
+                
+                if len(cv_by_algo) > 1:
+                    most_stable = min(cv_by_algo, key=cv_by_algo.get)
+                    f.write(f"\nOverall, **{most_stable}** showed more stable training behavior ")
+                    f.write(f"with a coefficient of variation of {cv_by_algo[most_stable]:.4f}.\n")
+            
+        # Final conclusions
+        f.write("\n## Overall Analysis\n\n")
+        
+        # Attempt to summarize key findings if we have both PPO and SAC metrics
+        if 'ppo_eval_rewards' in metrics_data and 'sac_eval_rewards' in metrics_data:
+            # Get final rewards
+            ppo_final = metrics_data['ppo_eval_rewards'].sort_values('steps').iloc[-1]
+            sac_final = metrics_data['sac_eval_rewards'].sort_values('steps').iloc[-1]
+            
+            # Get mean rewards
+            ppo_mean = metrics_data['ppo_eval_rewards']['reward'].mean()
+            sac_mean = metrics_data['sac_eval_rewards']['reward'].mean()
+            
+            # Step counts
+            ppo_step_count = ppo_steps if ppo_steps > 0 else "unknown"
+            sac_step_count = sac_steps if sac_steps > 0 else "unknown"
+            
+            f.write(f"### Key Observations\n\n")
+            
+            # Final performance comparison
+            f.write(f"- **Final Performance**: ")
+            if ppo_final['reward'] > sac_final['reward']:
+                f.write(f"PPO achieved higher final reward ({ppo_final['reward']:.2f}) compared to ")
+                f.write(f"SAC ({sac_final['reward']:.2f}), a difference of {(ppo_final['reward'] - sac_final['reward']):.2f} ")
+                f.write(f"({(ppo_final['reward'] / sac_final['reward'] * 100 - 100):.1f}% higher).\n")
+            elif sac_final['reward'] > ppo_final['reward']:
+                f.write(f"SAC achieved higher final reward ({sac_final['reward']:.2f}) compared to ")
+                f.write(f"PPO ({ppo_final['reward']:.2f}), a difference of {(sac_final['reward'] - ppo_final['reward']):.2f} ")
+                f.write(f"({(sac_final['reward'] / ppo_final['reward'] * 100 - 100):.1f}% higher).\n")
+            else:
+                f.write(f"Both algorithms achieved similar final rewards around {ppo_final['reward']:.2f}.\n")
+            
+            # Training efficiency
+            f.write(f"- **Training Duration**: PPO was trained for {ppo_step_count:,} steps, ")
+            f.write(f"while SAC was trained for {sac_step_count:,} steps ")
+            
+            if ppo_steps > 0 and sac_steps > 0:
+                if ppo_steps > sac_steps:
+                    f.write(f"({ppo_steps / sac_steps:.1f}x more for PPO).\n")
+                elif sac_steps > ppo_steps:
+                    f.write(f"({sac_steps / ppo_steps:.1f}x more for SAC).\n")
+                else:
+                    f.write("(equal training duration).\n")
+            else:
+                f.write(".\n")
+                
+            # Sample efficiency comparison if we have data on steps to 50% performance
+            if 'eval_rewards' in metrics_data:
+                eval_rewards = metrics_data['eval_rewards'].copy()
+                max_reward = eval_rewards['reward'].max()
+                mid_threshold = max_reward * 0.5
+                
+                steps_to_mid = {}
+                normalized_to_mid = {}
+                
+                for algo in eval_rewards['algorithm'].unique():
+                    algo_data = eval_rewards[eval_rewards['algorithm'] == algo].sort_values('steps')
+                    above_threshold = algo_data[algo_data['reward'] >= mid_threshold]
+                    
+                    if not above_threshold.empty:
+                        steps_to_mid[algo] = above_threshold.iloc[0]['steps']
+                        if 'normalized_steps' in above_threshold.columns:
+                            normalized_to_mid[algo] = above_threshold.iloc[0]['normalized_steps']
+                
+                if len(steps_to_mid) > 1:
+                    # Get algorithm names without step counts
+                    ppo_algo = [a for a in steps_to_mid.keys() if "PPO" in a][0]
+                    sac_algo = [a for a in steps_to_mid.keys() if "SAC" in a][0]
+                    
+                    # Compare raw steps
+                    f.write(f"- **Sample Efficiency**: ")
+                    if steps_to_mid[ppo_algo] < steps_to_mid[sac_algo]:
+                        f.write(f"PPO reached 50% performance in {steps_to_mid[ppo_algo]:,} steps vs ")
+                        f.write(f"SAC's {steps_to_mid[sac_algo]:,} steps ")
+                        f.write(f"({steps_to_mid[sac_algo] / steps_to_mid[ppo_algo]:.1f}x faster for PPO).\n")
+                    elif steps_to_mid[sac_algo] < steps_to_mid[ppo_algo]:
+                        f.write(f"SAC reached 50% performance in {steps_to_mid[sac_algo]:,} steps vs ")
+                        f.write(f"PPO's {steps_to_mid[ppo_algo]:,} steps ")
+                        f.write(f"({steps_to_mid[ppo_algo] / steps_to_mid[sac_algo]:.1f}x faster for SAC).\n")
+                    else:
+                        f.write(f"Both algorithms reached 50% performance in similar step counts.\n")
+                    
+                    # If we have normalized data, compare that as well
+                    if len(normalized_to_mid) > 1:
+                        f.write(f"- **Normalized Efficiency**: ")
+                        if normalized_to_mid[ppo_algo] < normalized_to_mid[sac_algo]:
+                            f.write(f"PPO reached 50% performance after completing {normalized_to_mid[ppo_algo]*100:.1f}% of training vs ")
+                            f.write(f"SAC's {normalized_to_mid[sac_algo]*100:.1f}% ")
+                            f.write(f"(relatively faster progress for PPO).\n")
+                        elif normalized_to_mid[sac_algo] < normalized_to_mid[ppo_algo]:
+                            f.write(f"SAC reached 50% performance after completing {normalized_to_mid[sac_algo]*100:.1f}% of training vs ")
+                            f.write(f"PPO's {normalized_to_mid[ppo_algo]*100:.1f}% ")
+                            f.write(f"(relatively faster progress for SAC).\n")
+                        else:
+                            f.write(f"Both algorithms showed similar relative progress rates.\n")
+            
+            # Stability comparison
+            if 'ppo_eval_rewards' in metrics_data and 'sac_eval_rewards' in metrics_data:
+                ppo_data = metrics_data['ppo_eval_rewards']
+                sac_data = metrics_data['sac_eval_rewards']
+                
+                ppo_cv = ppo_data['reward'].std() / ppo_data['reward'].mean() if ppo_data['reward'].mean() != 0 else float('inf')
+                sac_cv = sac_data['reward'].std() / sac_data['reward'].mean() if sac_data['reward'].mean() != 0 else float('inf')
+                
+                f.write(f"- **Training Stability**: ")
+                if ppo_cv < sac_cv:
+                    f.write(f"PPO showed more stable training (CV: {ppo_cv:.4f}) compared to ")
+                    f.write(f"SAC (CV: {sac_cv:.4f}).\n")
+                elif sac_cv < ppo_cv:
+                    f.write(f"SAC showed more stable training (CV: {sac_cv:.4f}) compared to ")
+                    f.write(f"PPO (CV: {ppo_cv:.4f}).\n")
+                else:
+                    f.write(f"Both algorithms showed similar stability in training.\n")
+            
+            # Overall conclusion
+            f.write("\n### Conclusion\n\n")
+            
+            # Attempt to give a balanced conclusion based on the data
+            if ppo_final['reward'] > sac_final['reward'] and ppo_steps > sac_steps:
+                f.write("PPO achieved higher final performance but required significantly more training steps. ")
+                if 'normalized_to_mid' in locals() and len(normalized_to_mid) > 1:
+                    ppo_algo = [a for a in normalized_to_mid.keys() if "PPO" in a][0]
+                    sac_algo = [a for a in normalized_to_mid.keys() if "SAC" in a][0]
+                    if normalized_to_mid[sac_algo] < normalized_to_mid[ppo_algo]:
+                        f.write("SAC showed faster relative progress during training, suggesting better sample efficiency. ")
+                    else:
+                        f.write("PPO showed faster relative progress despite needing more total steps. ")
+                        
+                if ppo_cv < sac_cv:
+                    f.write("PPO training was more stable, showing less variation in rewards. ")
+                else:
+                    f.write("SAC training was more stable despite achieving lower final performance. ")
+                    
+                f.write("\n\nThe choice between these algorithms depends on specific requirements:\n")
+                f.write("- If computational resources allow for longer training and maximum performance is the priority, PPO may be preferred.\n")
+                f.write("- If sample efficiency and quicker deployment are important, SAC could be the better option despite potentially lower final performance.\n")
+                
+            elif sac_final['reward'] > ppo_final['reward'] and ppo_steps > sac_steps:
+                f.write("SAC achieved higher final performance while requiring fewer training steps. ")
+                f.write("This suggests SAC is both more effective and more sample efficient for this task. ")
+                
+                if ppo_cv < sac_cv:
+                    f.write("However, PPO training was more stable, showing less variation in rewards. ")
+                else:
+                    f.write("SAC also demonstrated more stable training behavior. ")
+                    
+                f.write("\n\nBased on these results, SAC appears to be the superior algorithm for this particular environment, ")
+                f.write("offering better performance with fewer computational resources. The only potential advantage of PPO ")
+                f.write("might be in environments where training stability is the primary concern.\n")
+                
+            elif ppo_final['reward'] > sac_final['reward'] and sac_steps >= ppo_steps:
+                f.write("PPO achieved higher final performance with equal or fewer training steps compared to SAC. ")
+                f.write("This suggests PPO is both more effective and more sample efficient for this specific task. ")
+                
+                if ppo_cv < sac_cv:
+                    f.write("PPO training was also more stable, showing less variation in rewards. ")
+                else:
+                    f.write("However, SAC demonstrated more stable training behavior. ")
+                    
+                f.write("\n\nBased on these results, PPO appears to be the superior algorithm for this particular environment. ")
+                f.write("It achieves better performance without requiring more resources than SAC.\n")
+                
+            elif sac_final['reward'] > ppo_final['reward'] and sac_steps >= ppo_steps:
+                f.write("SAC achieved higher final performance despite requiring equal or more training steps. ")
+                
+                if sac_cv < ppo_cv:
+                    f.write("SAC training was also more stable, showing less variation in rewards. ")
+                else:
+                    f.write("However, PPO demonstrated more stable training behavior. ")
+                    
+                f.write("\n\nSAC appears to be the more effective algorithm for this task, though it may be less sample efficient. ")
+                f.write("If computational resources are limited, further investigation might be needed to find the optimal ")
+                f.write("training duration for both algorithms.\n")
+                
+            else:
+                f.write("Both algorithms performed comparably in terms of final performance. ")
+                
+                if ppo_steps != sac_steps:
+                    if ppo_steps > sac_steps:
+                        f.write("SAC achieved this with fewer training steps, suggesting better sample efficiency. ")
+                    else:
+                        f.write("PPO achieved this with fewer training steps, suggesting better sample efficiency. ")
+                        
+                if ppo_cv != sac_cv:
+                    if ppo_cv < sac_cv:
+                        f.write("PPO showed more stable training behavior with less reward variance. ")
+                    else:
+                        f.write("SAC showed more stable training behavior with less reward variance. ")
+                        
+                f.write("\n\nThe choice between these algorithms may depend on factors beyond performance, ")
+                f.write("such as implementation complexity, hyperparameter sensitivity, or specific requirements ")
+                f.write("of the deployment environment.\n")
 
 def main():
     """Main function for analyzing results."""
@@ -935,7 +1547,7 @@ def main():
     
     # Prepare data for analysis
     print("Preparing data for analysis...")
-    metrics_data = prepare_data(ppo_metrics, sac_metrics)
+    metrics_data = prepare_data(ppo_metrics, sac_metrics, config)
     
     # Plot learning curves and other visualizations
     print("Generating plots...")
@@ -943,7 +1555,7 @@ def main():
     
     # Generate statistical analysis
     print("Performing statistical analysis...")
-    generate_statistical_analysis(metrics_data, args.output_dir)
+    generate_statistical_analysis(metrics_data, config, args.output_dir)
     
     print(f"Analysis complete! Results saved to {args.output_dir}")
 

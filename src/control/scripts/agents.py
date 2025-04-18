@@ -669,8 +669,8 @@ class PPOCLIP(object):
                 
                 # Gradient clipping
                 if self.max_grad_norm > 0:
-                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
                 
                 self.policy_optimizer.step()
                 self.value_optimizer.step()
@@ -758,13 +758,19 @@ class PPOKL(object):
         self.value_loss_coef = args.value_loss_coef  # Value loss coefficient
         self.entropy_coef = args.entropy_coef     # Entropy coefficient
         self.max_grad_norm = args.max_grad_norm   # Maximum gradient norm
-        
+        self.use_clipped_value_loss = args.use_clipped_value_loss # Whether to use clipped value loss
+        self.clip_param = args.clip_param         # Clipping parameter (from PPO-CLIP)
+
+
         # KL-specific parameters
         self.kl_target = args.kl_target           # Target KL-divergence
-        self.kl_coef = args.kl_coef               # Initial KL coefficient
+        self.kl_beta = args.kl_beta               # Initial KL coefficient
         self.kl_adaptive = args.kl_adaptive       # Whether to adapt KL coefficient
         self.kl_cutoff_factor = args.kl_cutoff_factor  # KL cutoff factor
         self.kl_cutoff_coef = args.kl_cutoff_coef      # KL cutoff coefficient
+        self.min_kl_coef = args.min_kl_coef       # Minimum KL coefficient
+        self.max_kl_coef = args.max_kl_coef       # Maximum KL coefficient
+
 
         # Device setup
         self.device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
@@ -849,7 +855,7 @@ class PPOKL(object):
             numpy.ndarray: Batch of log probabilities
             numpy.ndarray: Batch of value estimates
         """
-        # Handle empty states case (can happen during evaluation)
+        # Handle empty states case (can happen during evaluation - gave me an error at 99%)
         if states.size == 0 or len(states.shape) < 2:
             return np.array([]), np.array([]), np.array([])
         
@@ -900,194 +906,179 @@ class PPOKL(object):
 
     def update_parameters(self, rollouts):
         """
-        Update policy and value parameters using PPO with KL-divergence constraint.
-        
-        Args:
-            rollouts: RolloutStorage containing batch of experiences
-            
-        Returns:
-            tuple: Loss values and metrics for logging
+        Update policy and value parameters using collected rollouts with KL penalty.
         """
         # Get rollout data
         rollout_data = rollouts.get_data()
+        
+        if len(rollout_data.get('states', [])) == 0:
+            return 0.0, 0.0, 0.0, 0.0, self.kl_beta
+        
+        # Convert data to tensors
         states = torch.FloatTensor(rollout_data['states']).to(self.device)
         actions = torch.FloatTensor(rollout_data['actions']).to(self.device)
         returns = torch.FloatTensor(rollout_data['returns']).to(self.device).view(-1, 1)
-        masks = torch.FloatTensor(rollout_data['masks']).to(self.device).view(-1, 1)
         old_log_probs = torch.FloatTensor(rollout_data['log_probs']).to(self.device).view(-1, 1)
         advantages = torch.FloatTensor(rollout_data['advantages']).to(self.device).view(-1, 1)
         
-        # Normalize advantages if enabled
-        if hasattr(self, 'normalize_advantages') and self.normalize_advantages:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalize advantages
+        if advantages.numel() > 1:
+            adv_mean, adv_std = advantages.mean(), advantages.std()
+            if adv_std > 1e-6:
+                advantages = (advantages - adv_mean) / adv_std
         
-        # Convert discrete actions to long tensors for indexing if needed
         if self.discrete and actions.shape[-1] == 1:
             actions = actions.long()
         
-        # Training info for logging
+        # Training tracking
         value_loss_epoch = 0
         policy_loss_epoch = 0
         entropy_epoch = 0
         kl_divergence_epoch = 0
         
-        # Create batches for multiple epochs of training on the same data
         batch_size = states.size(0)
-        mini_batch_size = batch_size // self.num_mini_batch
+        mini_batch_size = max(1, batch_size // self.num_mini_batch)
         
-        # Compute old action probabilities for KL-divergence calculation
+        # Get initial policy distribution for all states once
         with torch.no_grad():
             if self.discrete:
-                old_action_logits = self.policy(states)
-                old_action_probs = F.softmax(old_action_logits, dim=-1)
+                all_old_logits = self.policy(states)
+                all_old_probs = F.softmax(all_old_logits, dim=-1).detach()
             else:
-                old_means, old_log_stds = self.policy(states)
-                old_stds = old_log_stds.exp()
+                all_old_means, all_old_log_stds = self.policy(states)
+                all_old_means = all_old_means.detach()
+                all_old_stds = all_old_log_stds.exp().detach()
         
-        for _ in range(self.ppo_epoch):
-            # Generate random indices for creating mini-batches
+        # Training loop
+        for epoch in range(self.ppo_epoch):
             indices = torch.randperm(batch_size).to(self.device)
+            epoch_kl = 0
+            num_batches = 0
             
             for start_idx in range(0, batch_size, mini_batch_size):
-                # Extract mini-batch indices
                 end_idx = min(start_idx + mini_batch_size, batch_size)
                 mb_indices = indices[start_idx:end_idx]
                 
-                # Get mini-batch data
+                # Get batch data
                 mb_states = states[mb_indices]
                 mb_actions = actions[mb_indices]
                 mb_returns = returns[mb_indices]
-                mb_masks = masks[mb_indices]
                 mb_old_log_probs = old_log_probs[mb_indices]
                 mb_advantages = advantages[mb_indices]
                 
-                # Evaluate actions and get current log probs and entropy
-                if self.discrete:
-                    # For discrete actions
-                    action_logits = self.policy(mb_states)
-                    action_probs = F.softmax(action_logits, dim=-1)
-                    log_probs = F.log_softmax(action_logits, dim=-1)
-                    
-                    if mb_actions.shape[-1] == 1:  # If actions are indices
-                        # Calculate entropy - ensure it's a scalar by taking mean
-                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
-                        mb_new_log_probs = torch.gather(log_probs, 1, mb_actions)
-                    else:  # If actions are one-hot encoded
-                        # Calculate entropy - ensure it's a scalar by taking mean
-                        dist_entropy = (-torch.sum(action_probs * log_probs, dim=-1)).mean()
-                        mb_new_log_probs = (mb_actions * log_probs).sum(dim=-1, keepdim=True)
-                    
-                    # Calculate KL divergence between old and new policy
-                    mb_old_action_probs = old_action_probs[mb_indices]
-                    # Avoid numerical instability
-                    mb_old_action_probs = torch.clamp(mb_old_action_probs, 1e-10, 1.0)
-                    action_probs = torch.clamp(action_probs, 1e-10, 1.0)
-                    
-                    # Make sure KL divergence is a scalar
-                    kl_divergence = (mb_old_action_probs * 
-                                    torch.log(mb_old_action_probs / action_probs)).sum(dim=-1).mean()
-                else:
-                    # For continuous actions
-                    means, log_stds = self.policy(mb_states)
-                    stds = log_stds.exp()
-                    
-                    # Get log probabilities
-                    normal = torch.distributions.Normal(means, stds)
-                    mb_new_log_probs = normal.log_prob(mb_actions).sum(dim=-1, keepdim=True)
-                    
-                    # Compute entropy and ensure it's a scalar
-                    dist_entropy = normal.entropy()
-                    if dist_entropy.dim() > 0:
-                        dist_entropy = dist_entropy.mean()
-                    
-                    # Get old distribution parameters for this mini-batch
-                    mb_old_means = old_means[mb_indices]
-                    mb_old_stds = old_stds[mb_indices]
-                    
-                    # Calculate KL divergence between old and new policy
-                    # For multivariate Gaussian with diagonal covariance, KL is:
-                    # 0.5 * sum(log(new_var/old_var) + (old_var + (old_mean - new_mean)²)/new_var - 1)
-                    kl_term = ((log_stds - torch.log(mb_old_stds)).sum(dim=-1) +
-                            ((mb_old_stds.pow(2) + (mb_old_means - means).pow(2)) / 
-                            stds.pow(2)).sum(dim=-1) - 
-                            means.shape[-1])
-                    # Make sure KL divergence is a scalar
-                    kl_divergence = 0.5 * kl_term.mean()
-                
-                # Get current value prediction
+                # Forward pass
                 values = self.value_net(mb_states)
                 
-                # Calculate policy loss with KL penalty
-                # First, calculate the surrogate objective
-                ratios = torch.exp(mb_new_log_probs - mb_old_log_probs)
-                surrogate = ratios * mb_advantages
-                
-                # Apply KL-divergence penalty
-                if self.kl_adaptive:
-                    # Adaptive KL penalty based on how far we are from the target
-                    kl_penalty = self.kl_coef * kl_divergence
-                    # Additional penalty if KL divergence exceeds cutoff threshold
-                    if kl_divergence > self.kl_cutoff_factor * self.kl_target:
-                        kl_penalty += self.kl_cutoff_coef * (
-                            kl_divergence - self.kl_cutoff_factor * self.kl_target).pow(2)
+                if self.discrete:
+                    # Discrete actions
+                    mb_old_probs = all_old_probs[mb_indices].detach()
+                    logits = self.policy(mb_states)
+                    probs = F.softmax(logits, dim=-1)
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    
+                    # Get action log probabilities
+                    if mb_actions.dim() > 1 and mb_actions.size(1) == 1:
+                        mb_new_log_probs = torch.gather(log_probs, 1, mb_actions)
+                    else:
+                        mb_new_log_probs = log_probs.gather(1, mb_actions.unsqueeze(1))
+                    
+                    entropy = -(probs * log_probs).sum(-1).mean()
+                    
+                    # KL divergence
+                    kl = mb_old_probs * (torch.log(mb_old_probs + 1e-10) - torch.log(probs + 1e-10))
+                    kl_divergence = kl.sum(-1).mean()
+                    
+                    if kl_divergence < 1e-6:
+                        kl_divergence = torch.tensor(1e-6, device=self.device)
                 else:
-                    # Fixed KL penalty
-                    kl_penalty = self.kl_coef * kl_divergence
+                    # Continuous actions
+                    mb_old_means = all_old_means[mb_indices].detach()
+                    mb_old_stds = all_old_stds[mb_indices].detach()
+                    
+                    mean, log_std = self.policy(mb_states)
+                    std = log_std.exp()
+                    
+                    normal = torch.distributions.Normal(mean, std)
+                    mb_new_log_probs = normal.log_prob(mb_actions).sum(-1, keepdim=True)
+                    
+                    entropy = normal.entropy().sum(-1).mean()
+                    
+                    # Improved KL calculation
+                    var_ratio = (mb_old_stds / (std + 1e-10)).pow(2)
+                    mean_diff_term = ((mb_old_means - mean) / (std + 1e-10)).pow(2)
+                    log_std_diff = 2 * (log_std - torch.log(mb_old_stds + 1e-10))
+                    
+                    kl_div = 0.5 * (var_ratio + mean_diff_term - 1.0 - log_std_diff)
+                    kl_divergence = kl_div.sum(-1).mean()
+                    
+                    # Fallback for numerical stability
+                    if kl_divergence < 1e-6:
+                        std_diff = (std - mb_old_stds).pow(2).mean()
+                        mean_diff = (mean - mb_old_means).pow(2).mean()
+                        kl_divergence = 0.5 * (mean_diff + std_diff) + 1e-6
                 
-                # Final policy loss (ensure it's a scalar)
-                policy_loss = -surrogate.mean() + kl_penalty
+                # Calculate ratio and loss
+                ratio = torch.exp(mb_new_log_probs - mb_old_log_probs)
+                ratio = torch.clamp(ratio, 0.1, 10.0)
+                surrogate = ratio * mb_advantages
+                kl_penalty = self.kl_beta * kl_divergence
                 
-                # Value loss (simple MSE) - ensure it's a scalar
-                value_loss = 0.5 * F.mse_loss(values, mb_returns)
+                # Policy loss with KL penalty and entropy bonus
+                policy_loss = -surrogate.mean() + kl_penalty - self.entropy_coef * entropy
                 
-                # Combined loss with value and entropy terms
-                loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * dist_entropy
+                # Value loss
+                if self.use_clipped_value_loss:
+                    old_values = self.value_net(mb_states).detach()
+                    values_clipped = old_values + torch.clamp(values - old_values, -self.clip_param, self.clip_param)
+                    value_loss_unclipped = (values - mb_returns).pow(2)
+                    value_loss_clipped = (values_clipped - mb_returns).pow(2)
+                    value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+                else:
+                    value_loss = 0.5 * F.mse_loss(values, mb_returns)
                 
-                # Make sure loss is a scalar before calling backward()
-                if loss.dim() > 0:
-                    loss = loss.mean()
+                # Total loss
+                loss = policy_loss + self.value_loss_coef * value_loss
                 
-                # Update policy and value networks
-                self.policy_optimizer.zero_grad()
-                self.value_optimizer.zero_grad()
-                loss.backward()
+                if torch.isfinite(loss).all():
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    loss.backward()
+                    
+                    if self.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
                 
-                # Gradient clipping
-                if self.max_grad_norm > 0:
-                    policy_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                    # Use stronger gradient clipping for value network to help with high value loss
-                    value_grad_norm = torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm * 2)
-                
-                self.policy_optimizer.step()
-                self.value_optimizer.step()
-                
-                # Accumulate epoch statistics - ensure we're getting scalar values
+                # Track statistics
                 value_loss_epoch += value_loss.item()
                 policy_loss_epoch += policy_loss.item()
-                entropy_epoch += dist_entropy.item()
+                entropy_epoch += entropy.item()
                 kl_divergence_epoch += kl_divergence.item()
+                
+                epoch_kl += kl_divergence.item()
+                num_batches += 1
+            
+            # Adapt KL coefficient (with wider adjustment range)
+            if self.kl_adaptive and num_batches > 0:
+                avg_kl = epoch_kl / num_batches
+                
+                # More aggressive adjustment
+                if avg_kl < self.kl_target / 1.2:  # Changed from 1.5 to 1.2
+                    self.kl_beta = max(self.min_kl_coef / 10.0, self.kl_beta / 2.0)  # More aggressive decrease
+                elif avg_kl > self.kl_target * 1.2:  # Changed from 1.5 to 1.2
+                    self.kl_beta = min(self.max_kl_coef, self.kl_beta * 2.0)  # More aggressive increase
         
         # Calculate average statistics
-        num_updates = self.ppo_epoch * self.num_mini_batch
+        num_updates = max(1, self.ppo_epoch * num_batches)
         value_loss_epoch /= num_updates
         policy_loss_epoch /= num_updates
         entropy_epoch /= num_updates
         kl_divergence_epoch /= num_updates
         
-        # Update KL coefficient if adaptive
-        if self.kl_adaptive:
-            # Increase KL coefficient if KL divergence is too high
-            if kl_divergence_epoch > 1.5 * self.kl_target:
-                self.kl_coef *= 1.5
-            # Decrease KL coefficient if KL divergence is too low
-            elif kl_divergence_epoch < 0.5 * self.kl_target:
-                self.kl_coef /= 1.5
-            # Keep coefficient within reasonable bounds
-            # Use the new minimum KL coefficient parameter
-            min_kl_coef = getattr(self, 'min_kl_coef', 0.2)  # Default to 0.2 if not set
-            self.kl_coef = max(min_kl_coef, min(5.0, self.kl_coef))
+        return value_loss_epoch, policy_loss_epoch, entropy_epoch, kl_divergence_epoch, self.kl_beta
         
-        return value_loss_epoch, policy_loss_epoch, entropy_epoch, kl_divergence_epoch, self.kl_coef
     def save_checkpoint(self, env_name, suffix="", ckpt_path=None):
         """
         Save agent parameters to a checkpoint file.
@@ -1109,7 +1100,7 @@ class PPOKL(object):
             'value_net_state_dict': self.value_net.state_dict(),
             'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
             'value_optimizer_state_dict': self.value_optimizer.state_dict(),
-            'kl_coef': self.kl_coef
+            'kl_beta': self.kl_beta
         }, ckpt_path)
 
     def load_checkpoint(self, ckpt_path, evaluate=False):
@@ -1129,8 +1120,8 @@ class PPOKL(object):
             self.value_optimizer.load_state_dict(checkpoint['value_optimizer_state_dict'])
             
             # Load KL coefficient if present
-            if 'kl_coef' in checkpoint:
-                self.kl_coef = checkpoint['kl_coef']
+            if 'kl_beta' in checkpoint:
+                self.kl_beta = checkpoint['kl_beta']
 
             if evaluate:
                 self.policy.eval()

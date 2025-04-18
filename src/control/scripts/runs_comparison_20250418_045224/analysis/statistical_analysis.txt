@@ -1,0 +1,99 @@
+# Statistical Analysis of PPO Variants Performance
+
+## Training Rewards Analysis
+
+### Basic Training Statistics
+
+| Variant | Episodes | Mean | Median | Std Dev | Min | Max | Final |
+|---------|----------|------|--------|---------|-----|-----|-------|
+| PPOCLIP | 10000 | 1148.38 | 626.89 | 1319.46 | -276.94 | 6387.24 | 279.61 |
+| PPOKL | 10000 | 621.26 | 441.01 | 660.25 | -309.16 | 6173.22 | 290.09 |
+
+### Training Reward Statistical Comparison
+
+**PPOCLIP vs PPOKL**
+
+- t-test: t=35.726, p=0.00000 (statistically significant difference)
+- Mann-Whitney U test: U=61400319.500, p=0.00000 (statistically significant difference)
+- Effect size (Cohen's d): 0.505 (medium effect)
+
+## Evaluation Rewards Analysis
+
+### Basic Evaluation Statistics
+
+| Variant | Evaluations | Mean | Median | Std Dev | Min | Max | Final |
+|---------|-------------|------|--------|---------|-----|-----|-------|
+| PPOCLIP | 15 | 2199.79 | 2256.04 | 1016.98 | 432.11 | 3626.86 | 1246.67 |
+| PPOKL | 15 | 624.45 | 638.24 | 100.94 | 415.34 | 750.12 | 743.67 |
+
+### Evaluation Reward Statistical Comparison
+
+**PPOCLIP vs PPOKL**
+
+- t-test: t=5.970, p=0.00003 (statistically significant difference)
+- Mann-Whitney U test: U=207.000, p=0.00010 (statistically significant difference)
+- Effect size (Cohen's d): 2.256 (large effect)
+
+## Value Loss Analysis
+
+| Variant | Mean | Median | Std Dev | Min | Max |
+|---------|------|--------|---------|-----|-----|
+| PPOCLIP | 11968.28 | 13077.06 | 4504.38 | 3330.21 | 19145.98 |
+| PPOKL | 7022.18 | 7674.24 | 1658.17 | 2182.51 | 8958.93 |
+
+## Policy Loss Analysis
+
+| Variant | Mean | Median | Std Dev | Min | Max |
+|---------|------|--------|---------|-----|-----|
+| PPOCLIP | 0.023717 | 0.002415 | 0.031900 | -0.000424 | 0.097889 |
+| PPOKL | -0.047543 | -0.051599 | 0.014020 | -0.067333 | -0.006101 |
+
+## Entropy Analysis
+
+| Variant | Mean | Median | Std Dev | Min | Max |
+|---------|------|--------|---------|-----|-----|
+| PPOCLIP | 1.9309 | 1.7448 | 0.4384 | 1.4829 | 2.7868 |
+| PPOKL | 1.9596 | 1.9808 | 0.1644 | 1.4918 | 2.2677 |
+
+- **PPOKL** maintained higher entropy during training, which typically indicates greater exploration.
+- Higher entropy generally leads to more exploration, which can help in complex environments with challenging exploration requirements.
+
+### PPOCLIP-Specific Analysis
+
+- Average clip fraction: 0.1198
+- Clip fraction showed an **increasing trend** over training, suggesting policy updates became larger over time.
+- Clip fraction exceeded 0.2 in 28.6% of updates, suggesting the learning rate might be too high or the policy is changing too rapidly.
+
+## Efficiency Analysis
+
+| Variant | Average Reward/Step | Final Reward/Step | Max Reward/Step |
+|---------|---------------------|-------------------|----------------|
+| PPOCLIP | 8.2096 | 4.5837 | 29.1090 |
+| PPOKL | 5.9865 | 1.6672 | 28.2684 |
+
+### Efficiency Comparison
+
+The most efficient variant is **PPOCLIP** with an average reward per step of 8.2096.
+
+| Variant | Relative Efficiency |
+|---------|---------------------|
+| PPOCLIP | 100.00% |
+| PPOKL | 72.92% |
+
+## Final Recommendations
+
+Based on the analysis, **PPOCLIP** is recommended as the best overall variant due to highest final evaluation reward (1246.67).
+
+### Algorithm Comparison
+
+- **PPOCLIP** achieved better final evaluation performance (1246.67 vs 743.67).
+- **PPOCLIP** had better average evaluation performance (2199.79 vs 624.45).
+- **PPOKL** showed more stable training (CV: 1.0628 vs 1.1490).
+
+### Recommendations for Future Work
+
+1. For **PPOCLIP**, the current learning rate seems appropriate as clip fractions are in a reasonable range.
+
+3. Consider longer training for both algorithms as the learning curves suggest performance was still improving at the end of training.
+
+**Final Recommendation:** Based on this analysis, **PPOCLIP** is the recommended algorithm for this environment due to highest final evaluation reward (1246.67). Further hyperparameter tuning may lead to even better performance.
