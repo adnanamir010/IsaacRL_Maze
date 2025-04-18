@@ -1,21 +1,16 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
-import rclpy
-from rclpy.node import Node
-import threading
 import numpy as np
-import math
-import cv2
-import itertools
 import torch
 import argparse
 import datetime
-import copy
 import os
-import matplotlib.pyplot as plt
+import itertools
 import gc
-from tqdm import tqdm, trange
+import gymnasium as gym
+from tqdm import tqdm
 
+<<<<<<<< HEAD:src/control/scripts/isaac_train_sac.py
 # Initialize Isaac Sim Application
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
@@ -29,67 +24,21 @@ from isaac_agents import SAC
 from memory import ReplayMemory
 from isaac_environment import DDEnv
 from isaac_utils import ModelStateSubscriber, LidarSubscriber, CollisionDetector, save_learning_curve, evaluate_policy
+========
+from agents import SAC
+from memory import ReplayMemory
+from rl_utils import evaluate_policy, evaluate_policy_vec, save_learning_curve, collect_garbage
+from environment import VectorizedDDEnv, make_vectorized_env
+>>>>>>>> alternate_timeline:src/control/scripts/train_sac.py
 from torch.utils.tensorboard import SummaryWriter
-import global_vars
-
-# Configure PyTorch memory management
-torch.backends.cudnn.benchmark = True  # Optimize CUDNN
-torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for better performance
-torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for CUDNN
-
-# Enable ROS2 bridge extension
-ext_manager = omni.kit.app.get_app().get_extension_manager()
-ext_manager.set_extension_enabled_immediate("omni.isaac.ros2_bridge", True)
-
-# Spawn world with physics settings
-my_world = World(stage_units_in_meters=1.0, physics_dt=1/200, rendering_dt=1/20)
-
-# Load the USD stage
-isaac_path = os.environ["HOME"] + "/projects/IsaacRL_Maze/src/stage.usd"
-omni.usd.get_context().open_stage(isaac_path)
-
-# Wait for things to load
-simulation_app.update()
-while omni.isaac.core.utils.stage.is_stage_loading():
-    simulation_app.update()
-
-# Initialize simulation context
-simulation_context = omni.isaac.core.SimulationContext()
-simulation_context.initialize_physics()
-simulation_context.play()
-
-# Initialize global variables - using NumPy arrays with specific data types
-global_vars.body_pose = np.zeros(3, dtype=np.float32)  # x, y, theta
-global_vars.lidar_data = np.zeros(20, dtype=np.float32)
-global_vars.clash_sum = 0
-
-# Image settings for visualization and collision detection
-image_size = 720
-pixel_to_meter = 0.1  # m/pix
-wheelbase = 8  # length of robot
-stage_width = image_size * pixel_to_meter
-stage_height = image_size * pixel_to_meter
-
-# Set numpy print format for better readability
-float_formatter = "{:.2f}".format
-np.set_printoptions(formatter={'float_kind': float_formatter})
-
-# Memory management utilities
-def clear_cuda_cache():
-    """Clear CUDA cache to free up GPU memory"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        
-def collect_garbage():
-    """Force garbage collection"""
-    gc.collect()
-    clear_cuda_cache()
 
 def parse_arguments():
     """Parse command line arguments for the SAC algorithm"""
     parser = argparse.ArgumentParser(description='PyTorch Soft Actor-Critic Args')
-    parser.add_argument('--env-name', default="obstacle_avoidance",
-                    help='Environment name (default: obstacle_avoidance)')
+    parser.add_argument('--env-name', default="VectorizedDD",
+                    help='Environment name (default: VectorizedDD)')
+    parser.add_argument('--obstacle-shape', default="square",
+                    help='Obstacle shape: circular | square (default: square)')
     parser.add_argument('--policy', default="Gaussian",
                     help='Policy Type: Gaussian | Deterministic (default: Gaussian)')
     parser.add_argument('--eval', type=bool, default=True,
@@ -102,83 +51,76 @@ def parse_arguments():
                     help='Learning rate (default: 0.0003)')
     parser.add_argument('--alpha', type=float, default=0.2, metavar='G',
                     help='Temperature parameter α for entropy (default: 0.2)')
-    parser.add_argument('--automatic_entropy_tuning', type=bool, default=False, metavar='G',
-                    help='Automatically adjust α (default: False)')
+    parser.add_argument('--automatic_entropy_tuning', type=bool, default=True, metavar='G',
+                    help='Automatically adjust α (default: True)')
     parser.add_argument('--seed', type=int, default=123456, metavar='N',
                     help='Random seed (default: 123456)')
-    parser.add_argument('--batch_size', type=int, default=64, metavar='N',
-                    help='Batch size (default: 64)')
-    parser.add_argument('--num_steps', type=int, default=500_000, metavar='N',
-                    help='Maximum number of steps (default: 1000001)')
-    parser.add_argument('--hidden_size', type=int, default=64, metavar='N',
-                    help='Hidden size (default: 64)')
+    parser.add_argument('--batch_size', type=int, default=256, metavar='N',
+                    help='Batch size (default: 256)')
+    parser.add_argument('--num_steps', type=int, default=1_000_000, metavar='N',
+                    help='Maximum number of steps (default: 1_000_000)')
+    parser.add_argument('--hidden_size', type=int, default=128, metavar='N',
+                    help='Hidden size (default: 128)')
     parser.add_argument('--updates_per_step', type=int, default=1, metavar='N',
                     help='Model updates per simulator step (default: 1)')
-    parser.add_argument('--start_steps', type=int, default=4000, metavar='N',
-                    help='Steps sampling random actions (default: 4000)')
-    parser.add_argument('--target_update_interval', type=int, default=1, metavar='N',
-                    help='Value target update interval (default: 1)')
-    parser.add_argument('--replay_size', type=int, default=100_000, metavar='N',
-                    help='Size of replay buffer (default: 100_000)')
-    parser.add_argument('--cuda', action="store_true",
-                    help='Run on CUDA (default: False)')
-    parser.add_argument('--save-curve', action="store_true",
-                    help='Save learning curve plot (default: False)')
-    parser.add_argument('--curve-name', type=str, default='learning_curve',
-                    help='Filename for learning curve plot (default: learning_curve)')
+    parser.add_argument('--start_steps', type=int, default=10000, metavar='N',
+                    help='Steps sampling random actions (default: 10000)')
+    parser.add_argument('--target_update_interval', type=int, default=10, metavar='N',
+                    help='Value target update interval (default: 10)')
+    parser.add_argument('--replay_size', type=int, default=500_000, metavar='N',
+                    help='Size of replay buffer (default: 500_000)')
+    parser.add_argument('--cuda', action="store_true", default=True,
+                    help='Run on CUDA (default: True)')
+    parser.add_argument('--save-curve', action="store_true", default=True,
+                    help='Save learning curve plot (default: True)')
+    parser.add_argument('--curve-name', type=str, default='sac_vec_learning_curve',
+                    help='Filename for learning curve plot (default: sac_vec_learning_curve)')
     parser.add_argument('--memory-efficient', action="store_true", default=True,
                     help='Enable memory efficiency optimizations (default: True)')
-    parser.add_argument('--checkpoint-interval', type=int, default=20,
-                    help='Checkpoint save interval in episodes (default: 20)')
+    parser.add_argument('--checkpoint-interval', type=int, default=50,
+                    help='Checkpoint save interval in episodes (default: 50)')
     parser.add_argument('--gc-interval', type=int, default=50,
                     help='Garbage collection interval in episodes (default: 50)')
     parser.add_argument('--eval-episodes', type=int, default=10,
                     help='Number of episodes for evaluation (default: 10)')
-    parser.add_argument('--eval-interval', type=int, default=50,
-                    help='Evaluation interval in episodes (default: 50)')
-    parser.add_argument('--log-interval', type=int, default=5,
-                    help='Logging interval in episodes (default: 5)')
-    parser.add_argument('--num-episodes', type=int, default=1000,
-                help='Maximum number of episodes (default: 1000)')
+    parser.add_argument('--eval-interval', type=int, default=20,
+                    help='Evaluation interval in episodes (default: 20)')
+    parser.add_argument('--log-interval', type=int, default=10,
+                    help='Logging interval in episodes (default: 10)')
+    parser.add_argument('--num-envs', type=int, default=4,
+                    help='Number of parallel environments (default: 4)')
+    parser.add_argument('--render', action="store_true",
+                    help='Render visualization (only for training with num-envs=1) (default: False)')    
+    parser.add_argument('--use-twin-critic', action="store_true", default=True,
+                    help='Use twin critic (default: True)')
+    parser.add_argument('--entropy-mode', choices=['none', 'fixed', 'adaptive'], default='adaptive',
+                    help='Entropy mode: none, fixed, or adaptive (default: adaptive)')
+    parser.add_argument('--experiment-name', type=str, default=None,
+                    help='Name for this experiment (default: auto-generated)')
+
     return parser.parse_args()
 
 def main():
-    """Main training function with memory optimization and progress bar"""
+    """Main training function with vectorized environments and progress bar"""
     # Parse arguments
     args = parse_arguments()
+    
+    # For backward compatibility, set entropy_mode based on automatic_entropy_tuning
+    if hasattr(args, 'automatic_entropy_tuning'):
+        if args.automatic_entropy_tuning:
+            args.entropy_mode = 'adaptive'
+        else:
+            args.entropy_mode = 'fixed'
+    
+    # Generate experiment name if not provided
+    if args.experiment_name is None:
+        critic_type = "Twin" if args.use_twin_critic else "Single"
+        entropy_type = args.entropy_mode.capitalize()
+        args.experiment_name = f"{args.env_name}_{critic_type}Critic_{entropy_type}Entropy"
     
     # Set random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
-    # Initialize ROS2
-    rclpy.init(args=None)
-    
-    # Create environment and subscribers
-    env = DDEnv(my_world, simulation_context, image_size, pixel_to_meter,
-               stage_width, stage_height, wheelbase, global_vars.image, global_vars.image_for_clash_calc)
-    
-    model_state_subscriber = ModelStateSubscriber()
-    lidar_subscriber = LidarSubscriber()
-    collision_detector = CollisionDetector(image_size, pixel_to_meter)
-    
-    # Set up ROS2 executor for multi-threading
-    executor = rclpy.executors.MultiThreadedExecutor()
-    executor.add_node(env)
-    executor.add_node(model_state_subscriber)
-    executor.add_node(lidar_subscriber)
-    executor.add_node(collision_detector)
-    
-    # Start executor in a separate thread
-    executor_thread = threading.Thread(target=executor.spin, daemon=True)
-    executor_thread.start()
-    rate = env.create_rate(2)
-    
-    # Set up action space
-    action_space = type('obj', (), {'shape': [1], 'high': np.array([1.0]), 'low': np.array([-1.0])})()
-    
-    # Initialize SAC agent
-    agent = SAC(len(env.current_state), action_space, args)
     
     # Configure device
     device = torch.device("cuda" if args.cuda and torch.cuda.is_available() else "cpu")
@@ -190,153 +132,229 @@ def main():
     else:
         print("Using CPU")
     
+    # Create vectorized environments
+    print(f"Creating {args.num_envs} parallel environments for '{args.env_name}' with '{args.obstacle_shape}' obstacles")
+    
+    # Initialize render mode only if explicitly requested and only with a single environment
+    render_mode = "human" if args.render and args.num_envs == 1 else None
+    if args.render and args.num_envs > 1:
+        print("Warning: Rendering is only supported for single environment training. Disabling rendering.")
+    
+    if args.env_name == "VectorizedDD":
+        # Use our custom environment
+        if args.num_envs == 1 and render_mode:
+            # Single environment with rendering
+            env_fn = lambda: VectorizedDDEnv(render_mode=render_mode, obstacle_shape=args.obstacle_shape)
+            vec_env = gym.vector.SyncVectorEnv([env_fn])
+        else:
+            # Multiple environments or no rendering
+            vec_env = make_vectorized_env(num_envs=args.num_envs, seed=args.seed, obstacle_shape=args.obstacle_shape)
+        
+        # Create a single environment for evaluation
+        eval_env = make_vectorized_env(num_envs=1, seed=args.seed + 100, obstacle_shape=args.obstacle_shape)
+    else:
+        # Use standard Gym environment
+        vec_env = gym.vector.make(args.env_name, num_envs=args.num_envs, asynchronous=False)
+        eval_env = gym.vector.make(args.env_name, num_envs=1, asynchronous=False)
+    
+    # Get state and action dimensions
+    state_dim = vec_env.single_observation_space.shape[0]
+    
+    # Handle different types of action spaces
+    if isinstance(vec_env.single_action_space, gym.spaces.Box):
+        action_dim = vec_env.single_action_space.shape[0]
+        print(f"Continuous action space detected with {action_dim} dimensions")
+    elif isinstance(vec_env.single_action_space, gym.spaces.Discrete):
+        action_dim = 1  # Discrete action is represented as a single integer
+        print(f"Discrete action space detected with {vec_env.single_action_space.n} possible actions")
+    else:
+        raise ValueError(f"Unsupported action space type: {type(vec_env.single_action_space)}")
+        
+    print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
+    
+    # Set up action space
+    action_space = vec_env.single_action_space
+    
+    # Log configuration details
+    print(f"\nSAC Configuration:")
+    print(f"- Twin Critic: {args.use_twin_critic}")
+    print(f"- Entropy Mode: {args.entropy_mode}")
+    if args.entropy_mode == 'fixed':
+        print(f"- Alpha Value: {args.alpha}")
+    print()
+    
+    # Initialize SAC agent
+    agent = SAC(state_dim, action_space, args)
+    
     # Set up TensorBoard writer with reduced flush frequency to minimize I/O
-    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.env_name}_{args.policy}'
+    log_dir = f'runs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}_{args.experiment_name}'
     writer = SummaryWriter(log_dir, max_queue=1000, flush_secs=120)
     
     # Create replay memory with state and action dimensions
-    state_dim = len(env.current_state)
-    action_dim = action_space.shape[0]
     memory = ReplayMemory(args.replay_size, state_dim, action_dim, args.seed)
     
     # Training loop parameters
     total_numsteps = 0
     updates = 0
+<<<<<<<< HEAD:src/control/scripts/isaac_train_sac.py
     max_episode_steps = 220
+========
+>>>>>>>> alternate_timeline:src/control/scripts/train_sac.py
     
-    # Lists to store metrics for learning curve (using NumPy arrays for efficiency)
-    episode_rewards = []
-    episode_numbers = []
-    eval_rewards = []
-    eval_episode_numbers = []
+    # To keep track of episodes in vectorized environment
+    episode_rewards = [0] * args.num_envs
+    episode_steps = [0] * args.num_envs
+    episode_count = 0
+    
+    # Lists to store metrics for learning curve
+    all_episode_rewards = []
+    all_episode_numbers = []
+    all_eval_rewards = []
+    all_eval_episode_numbers = []
     
     # Initialize progress bar for total training
-    from tqdm import tqdm
     progress_bar = tqdm(total=args.num_steps, desc="Training Progress", unit="steps")
     last_update = 0
     
+    # Reset environments to get initial states
+    states, _ = vec_env.reset(seed=args.seed)
+    
     try:
-        for i_episode in itertools.count(1):
-            # Run garbage collection periodically to free memory
-            if i_episode % args.gc_interval == 0:
+        while total_numsteps < args.num_steps:
+            # Run garbage collection periodically
+            if total_numsteps % (args.gc_interval * args.num_envs) == 0:
                 collect_garbage()
             
-            episode_reward = 0
-            episode_steps = 0
-            done = False
-            
-            # Reset environment
-            state = env.reset()
-            
-            # Episode loop
-            while not done:
-                # Select action based on exploration strategy
-                if args.start_steps > total_numsteps:
-                    # Random action [-1, 1] - use numpy for efficiency
-                    action = np.random.uniform(-1, 1, (1,)).astype(np.float32)
+            # Select actions
+            if total_numsteps < args.start_steps:
+                # Sample random actions for initial exploration
+                if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
+                    # For discrete action space
+                    actions = np.array([vec_env.single_action_space.sample() for _ in range(args.num_envs)])
                 else:
-                    # Sample action from policy - with no_grad() to save memory
-                    with torch.no_grad():
-                        action = agent.select_action(state)
+                    # For continuous action space
+                    actions = np.array([vec_env.single_action_space.sample() for _ in range(args.num_envs)])
+            else:
+                # Sample actions from policy
+                actions = agent.select_actions_vec(states, evaluate=False)
+
+            if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
+                # Convert from array form [n] to scalar form n
+                if isinstance(actions, np.ndarray):
+                    if actions.ndim == 2 and actions.shape[1] == 1:
+                        # If shape is (n_envs, 1)
+                        actions = actions.flatten().astype(np.int32)
+                    elif actions.ndim == 1:
+                        # If shape is (n_envs,)
+                        actions = actions.astype(np.int32)
                 
-                # Perform updates if enough samples in memory - with memory optimizations
-                if len(memory) > args.batch_size:
-                    # Limit updates to reduce memory pressure during exploration
-                    max_updates = min(args.updates_per_step, 5 if total_numsteps < 50000 else 10)
-                    
-                    for i in range(max_updates):
-                        # Update agent parameters - wrap in no_grad for critic evaluation
-                        with torch.set_grad_enabled(True):
-                            critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(
-                                memory, args.batch_size, updates)
-                        
-                        # Log metrics only periodically to reduce overhead
-                        if updates % 100 == 0:
-                            writer.add_scalar('loss/critic_1', critic_1_loss, updates)
-                            writer.add_scalar('loss/critic_2', critic_2_loss, updates)
-                            writer.add_scalar('loss/policy', policy_loss, updates)
-                            writer.add_scalar('loss/entropy_loss', ent_loss, updates)
-                            writer.add_scalar('entropy_temperature/alpha', alpha, updates)
-                        
-                        updates += 1
-                
-                # Take a step in the environment
-                next_state, reward, done = env.step(action, episode_steps, max_episode_steps)
-                
-                episode_steps += 1
-                total_numsteps += 1
-                episode_reward += reward
-                
-                # Update progress bar
-                if total_numsteps > last_update:
-                    progress_bar.update(total_numsteps - last_update)
-                    progress_bar.set_postfix({
-                        'episode': i_episode,
-                        'ep_steps': episode_steps,
-                        'reward': f"{episode_reward:.2f}"
-                    })
-                    last_update = total_numsteps
-                
+            # Take steps in environments
+            next_states, rewards, terminations, truncations, infos = vec_env.step(actions)
+            
+            # Combine terminations and truncations
+            dones = np.logical_or(terminations, truncations)
+            
+            # Collect transitions in replay buffer
+            for i in range(args.num_envs):
                 # Handle the "done" signal properly for terminal vs time-limit cases
-                mask = 1 if episode_steps == max_episode_steps else float(not done)
+                # Most gym environments set done=True for both episode completion and time limits
+                # Here we assume all dones are true terminal states for simplicity
+                terminal_done = dones[i]
+                mask = 0.0 if terminal_done else 1.0  # Terminal state = 0, non-terminal = 1
                 
                 # Store transition in replay memory
-                memory.push(state, action, reward, next_state, mask)
+                if isinstance(vec_env.single_action_space, gym.spaces.Discrete):
+                    # Convert discrete action to one-hot vector or keep as scalar
+                    discrete_action = actions[i]
+                    memory.push(states[i], np.array([discrete_action]), rewards[i], next_states[i], mask)
+                else:
+                    # Continuous action
+                    memory.push(states[i], actions[i], rewards[i], next_states[i], mask)
                 
-                # Update state
-                state = next_state
+                # Update episode statistics
+                episode_rewards[i] += rewards[i]
+                episode_steps[i] += 1
                 
-                # Break if we've reached the step limit
-                if total_numsteps > args.num_steps:
-                    break
+                # Handle episode termination
+                if dones[i]:
+                    # Log episode stats
+                    episode_count += 1
+                    writer.add_scalar('reward/train', episode_rewards[i], episode_count)
+                    
+                    # Store training metrics for learning curve
+                    all_episode_rewards.append(episode_rewards[i])
+                    all_episode_numbers.append(episode_count)
+                    
+                    # Print progress
+                    tqdm.write(f"Episode {episode_count}: Reward={episode_rewards[i]:.2f}, Steps={episode_steps[i]}")
+                    
+                    # Reset episode stats
+                    episode_rewards[i] = 0
+                    episode_steps[i] = 0
+                    
+                    # Run evaluation periodically
+                    if episode_count % args.eval_interval == 0 and args.eval:
+                        # Set evaluation message
+                        progress_bar.set_description("Evaluating...")
+                        
+                        # Run evaluation
+                        eval_mean_reward, eval_std_reward = evaluate_policy_vec(
+                            agent, eval_env, max_eval_episodes=args.eval_episodes)
+                        
+                        # Log evaluation metrics
+                        writer.add_scalar('reward/eval', eval_mean_reward, episode_count)
+                        all_eval_rewards.append(eval_mean_reward)
+                        all_eval_episode_numbers.append(episode_count)
+                        
+                        # Print evaluation results
+                        progress_bar.write(f"Evaluation: {args.eval_episodes} episodes, " 
+                                          f"Mean Reward: {eval_mean_reward:.2f}, "
+                                          f"Std: {eval_std_reward:.2f}")
+                        
+                        # Reset progress bar description
+                        progress_bar.set_description("Training Progress")
+                        
+                        # Run garbage collection after evaluation
+                        collect_garbage()
+                    
+                    # Save model checkpoint periodically
+                    if episode_count % args.checkpoint_interval == 0:
+                        agent.save_checkpoint(args.env_name, suffix=f"{args.experiment_name}_{episode_count}")
+                        
+                        # Also save replay buffer occasionally for potential resume
+                        if episode_count % (args.checkpoint_interval * 5) == 0:
+                            memory.save_buffer(args.env_name, suffix=f"{args.experiment_name}_{episode_count}")
             
-            # Log episode metrics - only log periodically to reduce I/O
-            if i_episode % args.log_interval == 0:
-                writer.add_scalar('reward/train', episode_reward, i_episode)
-                
-            # Store training metrics for learning curve (convert to NumPy array at the end)
-            episode_rewards.append(episode_reward)
-            episode_numbers.append(i_episode)
+            # Perform updates if enough samples in memory
+            if len(memory) > args.batch_size:
+                # Number of updates per step
+                for _ in range(args.updates_per_step * args.num_envs):
+                    # Update agent parameters - wrap in no_grad for critic evaluation
+                    with torch.set_grad_enabled(True):
+                        critic_1_loss, critic_2_loss, policy_loss, ent_loss, alpha = agent.update_parameters(
+                            memory, args.batch_size, updates)
+                    
+                    # Log metrics only periodically to reduce overhead
+                    if updates % 100 == 0:
+                        writer.add_scalar('loss/critic_1', critic_1_loss, updates)
+                        writer.add_scalar('loss/critic_2', critic_2_loss, updates)
+                        writer.add_scalar('loss/policy', policy_loss, updates)
+                        writer.add_scalar('loss/entropy_loss', ent_loss, updates)
+                        writer.add_scalar('entropy_temperature/alpha', alpha, updates)
+                    
+                    updates += 1
             
-            # Evaluation phase - only run periodically to reduce overhead
-            if i_episode % args.eval_interval == 0 and args.eval:
-                # Temporarily pause the progress bar to display evaluation message
-                progress_bar.set_description("Evaluating...")
-                
-                # Run evaluation episodes
-                eval_rewards_batch = []
-                for eval_ep in range(args.eval_episodes):
-                    eval_reward = evaluate_policy(agent, env, max_episode_steps, eval_ep)
-                    eval_rewards_batch.append(eval_reward)
-                
-                # Calculate average reward
-                avg_reward = np.mean(eval_rewards_batch)
-                
-                writer.add_scalar('avg_reward/test', avg_reward, i_episode)
-                progress_bar.write(f"Evaluation: {args.eval_episodes} episodes, Avg. Reward: {avg_reward:.2f}")
-                
-                # Store evaluation metrics for learning curve
-                eval_rewards.append(avg_reward)
-                eval_episode_numbers.append(i_episode)
-                
-                # Run garbage collection after evaluation
-                collect_garbage()
-                
-                # Reset progress bar description
-                progress_bar.set_description("Training Progress")
+            # Update states
+            states = next_states
+            total_numsteps += args.num_envs
             
-            # Save model checkpoint periodically
-            if i_episode % args.checkpoint_interval == 0:
-                agent.save_checkpoint(args.env_name, suffix=str(i_episode))
-                
-                # Also save replay buffer occasionally for potential resume
-                if i_episode % (args.checkpoint_interval * 5) == 0:
-                    memory.save_buffer(args.env_name, suffix=str(i_episode))
+            # Update progress bar
+            progress_bar.update(args.num_envs)
+            progress_bar.set_postfix({
+                'episodes': episode_count,
+                'steps': total_numsteps
+            })
             
-            # Break if we've completed all steps
-            if total_numsteps > args.num_steps:
-                break
-                
     except KeyboardInterrupt:
         progress_bar.write("\nTraining interrupted by user")
     finally:
@@ -344,26 +362,30 @@ def main():
         progress_bar.close()
         
         # Final save
-        final_episode = i_episode if 'i_episode' in locals() else 0
-        if final_episode > 0:
-            print(f"Saving final checkpoint at episode {final_episode}")
-            agent.save_checkpoint(args.env_name, suffix=f"final_{final_episode}")
-            memory.save_buffer(args.env_name, suffix=f"final_{final_episode}")
+        if 'episode_count' in locals() and episode_count > 0:
+            print(f"Saving final checkpoint at episode {episode_count}")
+            agent.save_checkpoint(args.env_name, suffix=f"{args.experiment_name}_final_{episode_count}")
+            memory.save_buffer(args.env_name, suffix=f"{args.experiment_name}_final_{episode_count}")
         
         # Clean up
         writer.close()
+        vec_env.close()
+        eval_env.close()
         
         # Save learning curve if requested
-        if args.save_curve and episode_numbers:
+        if args.save_curve and all_episode_numbers:
             # Convert lists to NumPy arrays for efficient processing
-            episode_numbers_np = np.array(episode_numbers)
-            episode_rewards_np = np.array(episode_rewards)
+            episode_numbers_np = np.array(all_episode_numbers)
+            episode_rewards_np = np.array(all_episode_rewards)
             
-            eval_episode_numbers_np = np.array(eval_episode_numbers) if eval_episode_numbers else None
-            eval_rewards_np = np.array(eval_rewards) if eval_rewards else None
+            eval_episode_numbers_np = np.array(all_eval_episode_numbers) if all_eval_episode_numbers else None
+            eval_rewards_np = np.array(all_eval_rewards) if all_eval_rewards else None
             
+            # Include configuration in the curve name
+            curve_name = f"{args.curve_name}_{args.experiment_name}"
+            algorithm_name = f"{critic_type} Critic SAC with {entropy_type} Entropy"
             save_learning_curve(episode_numbers_np, episode_rewards_np, 
-                               eval_episode_numbers_np, eval_rewards_np, args.curve_name)
+                               eval_episode_numbers_np, eval_rewards_np, curve_name, algorithm_name)
         
         # Final cleanup
         collect_garbage()

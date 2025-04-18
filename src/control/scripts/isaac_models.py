@@ -20,12 +20,53 @@ def weights_init_(m):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         torch.nn.init.constant_(m.bias, 0)
 
+
+class ValueNetwork(nn.Module):
+    """
+    Value network that estimates state values for PPO.
+    """
+    def __init__(self, num_inputs, hidden_dim, init_w=3e-3):
+        """
+        Initialize Value Network.
+        
+        Args:
+            num_inputs (int): Dimension of state space
+            hidden_dim (int): Size of hidden layers
+            init_w (float): Weight initialization range
+        """
+        super(ValueNetwork, self).__init__()
+        
+        # MLP for value function
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = nn.Linear(hidden_dim, 1)
+        
+        # Weight initialization
+        self.apply(weights_init_)
+        
+    def forward(self, state):
+        """
+        Forward pass to get state value.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            
+        Returns:
+            torch.Tensor: State value estimate
+        """
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        x = self.linear3(x)
+        
+        return x
+
+
 class QNetwork(nn.Module):
     """
     Critic network for SAC that estimates Q-values (state-action values).
     Implements the double Q-network architecture.
     """
-    def __init__(self, num_inputs, num_actions, hidden_dim):
+    def __init__(self, num_inputs, num_actions, hidden_dim, discrete=False):
         """
         Initialize Q-Network.
         
@@ -33,73 +74,118 @@ class QNetwork(nn.Module):
             num_inputs (int): Dimension of the state space
             num_actions (int): Dimension of the action space
             hidden_dim (int): Size of hidden layers
+            discrete (bool): Whether the action space is discrete
         """
         super(QNetwork, self).__init__()
+        
+        self.discrete = discrete
+        
+        if discrete:
+            # For discrete actions, we don't concatenate actions with states
+            # Q1 architecture
+            self.linear1_q1 = nn.Linear(num_inputs, hidden_dim)
+            self.linear2_q1 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear3_q1 = nn.Linear(hidden_dim, num_actions)  # Outputs Q-value for each action
+            
+            # Q2 architecture (for double Q-learning)
+            self.linear1_q2 = nn.Linear(num_inputs, hidden_dim)
+            self.linear2_q2 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear3_q2 = nn.Linear(hidden_dim, num_actions)  # Outputs Q-value for each action
+        else:
+            # Continuous actions - concatenate action with state
+            # Q1 architecture
+            self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear3 = nn.Linear(hidden_dim, 1)
 
-        # Q1 architecture
-        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, int(hidden_dim/2))
-        self.linear3 = nn.Linear(int(hidden_dim/2), 1)
-
-        # Q2 architecture (for double Q-learning)
-        self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
-        self.linear5 = nn.Linear(hidden_dim, int(hidden_dim/2))
-        self.linear6 = nn.Linear(int(hidden_dim/2), 1)
+            # Q2 architecture (for double Q-learning)
+            self.linear4 = nn.Linear(num_inputs + num_actions, hidden_dim)
+            self.linear5 = nn.Linear(hidden_dim, hidden_dim)
+            self.linear6 = nn.Linear(hidden_dim, 1)
 
         self.apply(weights_init_)
 
-    def forward(self, state, action):
+    def forward(self, state, action=None):
         """
         Compute Q-values for given state-action pairs.
         
         Args:
             state (torch.Tensor): State tensor
-            action (torch.Tensor): Action tensor
+            action (torch.Tensor): Action tensor (only needed for continuous action spaces)
             
         Returns:
             tuple: (Q1 value, Q2 value)
         """
-        # Concatenate state and action as input
-        xu = torch.cat([state, action], 1)
-        
-        # First Q-network
-        x1 = F.relu(self.linear1(xu))
-        x1 = F.relu(self.linear2(x1))
-        x1 = self.linear3(x1)
+        if self.discrete:
+            # For discrete actions, we output Q-values for all actions
+            x1 = F.relu(self.linear1_q1(state))
+            x1 = F.relu(self.linear2_q1(x1))
+            q1 = self.linear3_q1(x1)
+            
+            x2 = F.relu(self.linear1_q2(state))
+            x2 = F.relu(self.linear2_q2(x2))
+            q2 = self.linear3_q2(x2)
+            
+            # If action is provided, use it to select specific Q-values
+            if action is not None:
+                action_indices = action.long()
+                q1 = q1.gather(1, action_indices)
+                q2 = q2.gather(1, action_indices)
+                
+            return q1, q2
+        else:
+            # Continuous actions - concatenate action with state
+            xu = torch.cat([state, action], 1)
+            
+            # First Q-network
+            x1 = F.relu(self.linear1(xu))
+            x1 = F.relu(self.linear2(x1))
+            x1 = self.linear3(x1)
 
-        # Second Q-network
-        x2 = F.relu(self.linear4(xu))
-        x2 = F.relu(self.linear5(x2))
-        x2 = self.linear6(x2)
+            # Second Q-network
+            x2 = F.relu(self.linear4(xu))
+            x2 = F.relu(self.linear5(x2))
+            x2 = self.linear6(x2)
 
-        return x1, x2
+            return x1, x2
     
-    def Q1(self, state, action):
+    def Q1(self, state, action=None):
         """
         Returns only the first Q-value, useful for computing actor loss.
         
         Args:
             state (torch.Tensor): State tensor
-            action (torch.Tensor): Action tensor
+            action (torch.Tensor): Action tensor (only needed for continuous action spaces)
             
         Returns:
             torch.Tensor: Q1 value
         """
-        # Concatenate state and action
-        xu = torch.cat([state, action], 1)
-        
-        # Forward pass through first Q-network only
-        x1 = F.relu(self.linear1(xu))
-        x1 = F.relu(self.linear2(x1))
-        x1 = self.linear3(x1)
-        
-        return x1
+        if self.discrete:
+            # For discrete actions
+            x1 = F.relu(self.linear1_q1(state))
+            x1 = F.relu(self.linear2_q1(x1))
+            q1 = self.linear3_q1(x1)
+            
+            # If action is provided, select specific Q-values
+            if action is not None:
+                action_indices = action.long()
+                q1 = q1.gather(1, action_indices)
+                
+            return q1
+        else:
+            # For continuous actions
+            xu = torch.cat([state, action], 1)
+            
+            x1 = F.relu(self.linear1(xu))
+            x1 = F.relu(self.linear2(x1))
+            x1 = self.linear3(x1)
+            
+            return x1
 
 
 class GaussianPolicy(nn.Module):
     """
     Stochastic policy that outputs a Gaussian distribution over actions.
-    Uses GRU layers for sequence modeling capabilities.
     """
     def __init__(self, num_inputs, num_actions, hidden_dim, action_space=None):
         """
@@ -113,13 +199,13 @@ class GaussianPolicy(nn.Module):
         """
         super(GaussianPolicy, self).__init__()
         
-        # GRU layers for sequence modeling
-        self.gru1 = nn.GRU(num_inputs, hidden_dim)
-        self.gru2 = nn.GRU(hidden_dim, int(hidden_dim/2))
+        # MLP layers
+        self.linear1 = nn.Linear(num_inputs, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
 
         # Policy head for mean and log standard deviation
-        self.mean_linear = nn.Linear(int(hidden_dim/2), num_actions)
-        self.log_std_linear = nn.Linear(int(hidden_dim/2), num_actions)
+        self.mean_linear = nn.Linear(hidden_dim, num_actions)
+        self.log_std_linear = nn.Linear(hidden_dim, num_actions)
 
         self.apply(weights_init_)
 
@@ -128,11 +214,8 @@ class GaussianPolicy(nn.Module):
             self.action_scale = torch.tensor(1.)
             self.action_bias = torch.tensor(0.)
         else:
-            high = np.ones(action_space.shape[0])
-            low = -1 * np.ones(action_space.shape[0])
-
-            self.action_scale = torch.FloatTensor((high - low) / 2.)
-            self.action_bias = torch.FloatTensor((high + low) / 2.)
+            self.action_scale = torch.FloatTensor((action_space.high - action_space.low) / 2.)
+            self.action_bias = torch.FloatTensor((action_space.high + action_space.low) / 2.)
 
     def forward(self, state):
         """
@@ -144,11 +227,9 @@ class GaussianPolicy(nn.Module):
         Returns:
             tuple: (mean, log_std) of action distribution
         """
-        # Process through GRU layers
-        x, _ = self.gru1(state)
-        x = F.relu(x)
-        x, _ = self.gru2(x)
-        x = F.relu(x)
+        # Forward pass through shared layers
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
         
         # Compute mean and log standard deviation
         mean = self.mean_linear(x)
@@ -189,6 +270,43 @@ class GaussianPolicy(nn.Module):
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
         
         return action, log_prob, mean
+        
+    def evaluate(self, state, action):
+        """
+        Evaluate an action given a state, useful for PPO to get new log probs for old actions.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            action (torch.Tensor): Action tensor
+            
+        Returns:
+            tuple: (action, log_prob, entropy) - resampled action, log probability, and entropy
+        """
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        
+        # Create normal distribution
+        normal = torch.distributions.Normal(mean, std)
+        
+        # Get log probabilities
+        # For actions in tanh-transformed space, we need to apply correction
+        action_normalized = (action - self.action_bias) / self.action_scale
+        
+        # Inverse tanh to get original gaussian samples x_t
+        action_normalized = torch.clamp(action_normalized, -0.999, 0.999)  # Avoid numerical instability
+        x_t = 0.5 * torch.log((1 + action_normalized) / (1 - action_normalized))
+        
+        # Get log probability
+        log_prob = normal.log_prob(x_t)
+        
+        # Apply tanh correction: log(1 - tanh^2(x)) = log(1 - y^2)
+        log_prob -= torch.log(self.action_scale * (1 - action_normalized.pow(2)) + EPSILON)
+        log_prob = log_prob.sum(1, keepdim=True)
+        
+        # Compute entropy
+        entropy = normal.entropy().sum(1, keepdim=True)
+        
+        return action, log_prob, entropy
 
     def to(self, device):
         """
@@ -204,6 +322,8 @@ class GaussianPolicy(nn.Module):
         self.action_bias = self.action_bias.to(device)
         return super(GaussianPolicy, self).to(device)
 
+
+# Add these class definitions to your models.py file
 
 class DeterministicPolicy(nn.Module):
     """
@@ -288,110 +408,114 @@ class DeterministicPolicy(nn.Module):
         return super(DeterministicPolicy, self).to(device)
 
 
-class ValueNetwork(nn.Module):
+class DiscretePolicy(nn.Module):
     """
-    Value network for PPO or other algorithms that need state value estimates.
+    Policy for discrete action spaces in SAC.
     """
-    def __init__(self, num_inputs, hidden_dim):
+    def __init__(self, num_inputs, num_actions, hidden_dim):
         """
-        Initialize Value Network.
+        Initialize Discrete Policy.
         
         Args:
-            num_inputs (int): Dimension of the state space
+            num_inputs (int): Dimension of state space
+            num_actions (int): Number of discrete actions
             hidden_dim (int): Size of hidden layers
         """
-        super(ValueNetwork, self).__init__()
-
+        super(DiscretePolicy, self).__init__()
+        
         self.linear1 = nn.Linear(num_inputs, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, hidden_dim)
-        self.linear3 = nn.Linear(hidden_dim, 1)
-
+        
+        # Output logits for each action
+        self.linear3 = nn.Linear(hidden_dim, num_actions)
+        
+        self.num_actions = num_actions
         self.apply(weights_init_)
-
+        
     def forward(self, state):
         """
-        Compute state value.
+        Compute action probabilities for the given state.
         
         Args:
             state (torch.Tensor): State tensor
             
         Returns:
-            torch.Tensor: State value
+            torch.Tensor: Action logits
         """
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        x = self.linear3(x)
-        return x
-
-
-class ActorCritic(nn.Module):
-    """
-    Combined actor-critic network for PPO.
-    """
-    def __init__(self, num_inputs, num_actions, hidden_dim, action_space=None):
+        action_logits = self.linear3(x)
+        
+        return action_logits
+    
+    def sample(self, state):
         """
-        Initialize Actor-Critic Network.
-        
-        Args:
-            num_inputs (int): Dimension of the state space
-            num_actions (int): Dimension of the action space
-            hidden_dim (int): Size of hidden layers
-            action_space: Action space with high and low bounds (optional)
-        """
-        super(ActorCritic, self).__init__()
-        
-        # Actor (policy) network
-        self.actor = GaussianPolicy(num_inputs, num_actions, hidden_dim, action_space)
-        
-        # Critic (value) network
-        self.critic = ValueNetwork(num_inputs, hidden_dim)
-        
-    def forward(self, state):
-        """
-        Compute both policy and value.
+        Sample actions from the policy.
         
         Args:
             state (torch.Tensor): State tensor
             
         Returns:
-            tuple: (action_mean, action_log_std, state_value)
+            tuple: (action, log_prob, action_probs)
         """
-        mean, log_std = self.actor(state)
-        value = self.critic(state)
+        action_logits = self.forward(state)
         
-        return mean, log_std, value
+        # Use Gumbel-Softmax for differentiable discrete sampling
+        action_probs = F.softmax(action_logits, dim=-1)
+        action_dist = torch.distributions.Categorical(action_probs)
         
-    def act(self, state, deterministic=False):
-        """
-        Sample action from policy.
-        
-        Args:
-            state (torch.Tensor): State tensor
-            deterministic (bool): Whether to use deterministic action (mean)
-            
-        Returns:
-            tuple: (action, log_prob, entropy, state_value)
-        """
-        mean, log_std = self.actor(state)
-        std = log_std.exp()
-        
-        # Create normal distribution
-        normal = Normal(mean, std)
-        
-        if deterministic:
-            action = mean
+        # Sample an action
+        if len(state.shape) == 1 or state.shape[0] == 1:
+            # Single state
+            action = action_dist.sample().unsqueeze(-1)
         else:
-            # Sample action
-            action = normal.sample()
+            # Batch of states
+            action = action_dist.sample().unsqueeze(-1)
+        
+        # Calculate log probability
+        z = action_probs == 0.0
+        z = z.float() * 1e-8
+        log_prob = torch.log(action_probs + z)
+        log_prob = torch.gather(log_prob, -1, action)
+        
+        return action, log_prob, action_probs
+        
+    def evaluate(self, state, action):
+        """
+        Evaluate an action given a state, useful for PPO to get new log probs for old actions.
+        
+        Args:
+            state (torch.Tensor): State tensor
+            action (torch.Tensor): Action tensor (indices)
             
-        # Compute log probability and entropy
-        log_prob = normal.log_prob(action).sum(-1, keepdim=True)
-        entropy = normal.entropy().sum(-1, keepdim=True)
+        Returns:
+            tuple: (action, log_prob, entropy) - same action, log probability, and entropy
+        """
+        action_logits = self.forward(state)
+        action_probs = F.softmax(action_logits, dim=-1)
+        log_probs = F.log_softmax(action_logits, dim=-1)
         
-        # Apply tanh and scale
-        action = torch.tanh(action) * self.actor.action_scale + self.actor.action_bias
+        # Calculate entropy
+        entropy = -torch.sum(action_probs * log_probs, dim=-1, keepdim=True)
         
-        # Compute value
-        value = self.critic(state)
+        # Get log probabilities for the given actions
+        if action.dim() == 2 and action.size(1) == 1:
+            # If actions are indices
+            selected_log_probs = torch.gather(log_probs, 1, action.long())
+        else:
+            # If actions are one-hot encoded
+            selected_log_probs = (action * log_probs).sum(dim=-1, keepdim=True)
         
-        return action, log_prob, entropy, value
+        return action, selected_log_probs, entropy
+    
+    def to(self, device):
+        """
+        Move model to specified device.
+        
+        Args:
+            device: Device to move the model to
+            
+        Returns:
+            DiscretePolicy: Self reference for chaining
+        """
+        return super(DiscretePolicy, self).to(device)

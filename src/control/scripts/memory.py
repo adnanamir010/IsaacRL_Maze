@@ -5,8 +5,11 @@ import numpy as np
 import os
 
 import pickle
+<<<<<<< HEAD
 
 
+=======
+>>>>>>> alternate_timeline
 
 class ReplayMemory:
 
@@ -17,9 +20,13 @@ class ReplayMemory:
     Uses NumPy arrays for efficient storage and access of transitions.
 
     """
+<<<<<<< HEAD
 
     def __init__(self, capacity, state_dim, action_dim, seed=0):
 
+=======
+    def __init__(self, capacity, state_dim, action_dim, seed=0):
+>>>>>>> alternate_timeline
         """
 
         Initialize optimized replay buffer with pre-allocated NumPy arrays.
@@ -107,6 +114,7 @@ class ReplayMemory:
         self.position = (self.position + 1) % self.capacity
 
         self.size = min(self.size + 1, self.capacity)
+<<<<<<< HEAD
 
     
 
@@ -116,6 +124,35 @@ class ReplayMemory:
 
         Add a batch of transitions to the buffer (vectorized version).
 
+=======
+    
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """
+        Add a batch of transitions to the buffer (vectorized version).
+        
+        Args:
+            states: Batch of current states
+            actions: Batch of actions taken
+            rewards: Batch of rewards received
+            next_states: Batch of next states
+            dones: Batch of episode termination flags
+        """
+        batch_size = len(states)
+        
+        # Calculate indices for the batch, handling buffer wrapping
+        indices = np.arange(self.position, self.position + batch_size) % self.capacity
+        
+        # Store transitions
+        self.states[indices] = states
+        self.actions[indices] = actions
+        self.rewards[indices] = rewards
+        self.next_states[indices] = next_states
+        self.dones[indices] = dones
+        
+        # Update position and size
+        self.position = (self.position + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
+>>>>>>> alternate_timeline
         
 
         Args:
@@ -417,9 +454,13 @@ class RolloutStorage:
         self.full = False
 
         
+<<<<<<< HEAD
 
     def push(self, state, action, reward, value, log_prob, mask, entropy=None):
 
+=======
+    def push(self, state, action, reward, value, log_prob, mask, action_probs=None, means=None, log_stds=None):
+>>>>>>> alternate_timeline
         """
 
         Add a new transition to the storage.
@@ -439,6 +480,7 @@ class RolloutStorage:
             log_prob: Log probability of action
 
             mask: 1 - done (0 if episode terminated, 1 otherwise)
+<<<<<<< HEAD
 
             entropy: Action distribution entropy (optional)
 
@@ -471,6 +513,73 @@ class RolloutStorage:
             self.full = True
 
             
+=======
+            action_probs: Action probabilities for discrete actions
+            means: Action means for continuous actions
+            log_stds: Action log standard deviations for continuous actions
+        """            
+        # Ensure we have valid data
+        if state is None or np.size(state) == 0:
+            print("WARNING: Attempted to push None or empty state!")
+            return
+            
+        if self.position >= self.capacity:
+            print(f"WARNING: Position {self.position} exceeds capacity {self.capacity}!")
+            return
+        
+        try:
+            # Store the data - use numpy's direct assignment
+            self.states[self.position] = state
+            self.actions[self.position] = action
+            
+            # For scalar values, ensure proper conversion
+            if isinstance(reward, (list, tuple)) and len(reward) == 1:
+                self.rewards[self.position] = reward[0]
+            else:
+                self.rewards[self.position] = reward
+                
+            if isinstance(value, (list, tuple)) and len(value) == 1:
+                self.values[self.position] = value[0]
+            else:
+                self.values[self.position] = value
+                
+            if isinstance(log_prob, (list, tuple)) and len(log_prob) == 1:
+                self.log_probs[self.position] = log_prob[0]
+            else:
+                self.log_probs[self.position] = log_prob
+                
+            if isinstance(mask, (list, tuple)) and len(mask) == 1:
+                self.masks[self.position] = mask[0]
+            else:
+                self.masks[self.position] = mask
+            
+            # Store policy distribution parameters if provided
+            if action_probs is not None:
+                if not hasattr(self, 'action_probs'):
+                    # Initialize on first use
+                    self.action_probs = np.zeros((self.capacity, len(action_probs)), dtype=np.float32)
+                self.action_probs[self.position] = action_probs
+                
+            if means is not None and log_stds is not None:
+                if not hasattr(self, 'means'):
+                    # Initialize on first use
+                    self.means = np.zeros((self.capacity, len(means)), dtype=np.float32)
+                    self.log_stds = np.zeros((self.capacity, len(log_stds)), dtype=np.float32)
+                self.means[self.position] = means
+                self.log_stds[self.position] = log_stds
+            
+            # Critical: Increment position
+            self.position += 1
+            
+            # Check if storage is full
+            if self.position >= self.capacity:
+                self.full = True
+                
+        except Exception as e:
+            print(f"ERROR in push to rollout storage: {e}")
+            import traceback
+            traceback.print_exc()
+>>>>>>> alternate_timeline
 
     def compute_returns(self, next_value, gamma, gae_lambda):
 
@@ -495,10 +604,18 @@ class RolloutStorage:
         # Calculate how many steps we actually have
 
         num_steps = self.capacity if self.full else self.position
+<<<<<<< HEAD
 
+=======
+        
+        if num_steps == 0:
+            print("Warning: No steps in rollout storage. Cannot compute returns.")
+            return
+>>>>>>> alternate_timeline
             
 
         # Initialize advantage
+<<<<<<< HEAD
 
         self.advantages.fill(0)
 
@@ -530,6 +647,96 @@ class RolloutStorage:
 
             next_val = next_value  # Already a scalar
 
+=======
+        self.advantages[:num_steps] = 0.0
+        last_advantage = 0.0
+        
+        # Convert next_value to a scalar if it's not already
+        if isinstance(next_value, np.ndarray):
+            if next_value.size == 1:
+                next_val = float(next_value[0])  # Convert single-element array to scalar
+            else:
+                next_val = float(next_value.mean())  # Take the mean if multiple values
+        elif isinstance(next_value, list):
+            next_val = float(np.mean(next_value))  # Take mean if it's a list
+        elif hasattr(next_value, 'item'):  # Torch tensor
+            next_val = float(next_value.item())  # Convert tensor to scalar
+        else:
+            next_val = float(next_value)  # Already a scalar
+                
+        # Compute returns and advantages in reverse order
+        for step in reversed(range(num_steps)):
+            # For the last step, use the provided next_value
+            if step == num_steps - 1:
+                next_val_step = next_val
+            else:
+                next_val_step = self.values[step + 1]
+                
+            # Calculate delta (TD error)
+            delta = self.rewards[step] + gamma * next_val_step * self.masks[step] - self.values[step]
+            
+            # Update advantage using GAE
+            last_advantage = delta + gamma * gae_lambda * self.masks[step] * last_advantage
+            self.advantages[step] = last_advantage
+        
+        # Calculate returns (advantage + value)
+        self.returns[:num_steps] = self.advantages[:num_steps] + self.values[:num_steps]
+            
+    def get_data(self):
+        """
+        Get all stored data as a dictionary.
+        
+        Returns:
+            dict: Dictionary containing all stored data
+        """
+        if self.full:
+            num_steps = self.capacity
+        else:
+            num_steps = self.position
+            
+        data = {
+            'states': self.states[:num_steps],
+            'actions': self.actions[:num_steps],
+            'rewards': self.rewards[:num_steps],
+            'values': self.values[:num_steps],
+            'returns': self.returns[:num_steps],
+            'advantages': self.advantages[:num_steps],
+            'log_probs': self.log_probs[:num_steps],
+            'masks': self.masks[:num_steps],
+        }
+        
+        # Add policy distribution parameters if they exist
+        if hasattr(self, 'action_probs'):
+            data['action_probs'] = self.action_probs[:num_steps]
+        if hasattr(self, 'means') and hasattr(self, 'log_stds'):
+            data['means'] = self.means[:num_steps]
+            data['log_stds'] = self.log_stds[:num_steps]
+            
+        return data
+
+    def debug_info(self):
+        """Print debug information about storage state"""
+        position = self.position
+        capacity = self.capacity
+        print(f"RolloutStorage Debug - Position: {position}/{capacity}")
+        
+        # Check if data exists
+        has_states = hasattr(self, 'states') and self.states is not None
+        has_actions = hasattr(self, 'actions') and self.actions is not None
+        
+        print(f"Storage has states: {has_states}, has actions: {has_actions}")
+        
+        if has_states and position > 0:
+            print(f"First state sample: {self.states[0][:5]}...")
+            print(f"Last state sample: {self.states[position-1][:5]}...")
+        
+        return position > 0
+
+    def clear(self):
+        """Reset the storage by simply resetting position."""
+        self.position = 0
+        self.full = False
+>>>>>>> alternate_timeline
         
 
         # Compute returns and advantages in reverse order (more efficient in NumPy)
